@@ -727,3 +727,61 @@ input[type="text"]:focus, input[type="password"]:focus, .money-field:focus-withi
 .form-grid label { display: block; font-size: 12px; color: var(--muted); font-weight: 700; margin-bottom: 10px; }
 .form-grid input[type="number"] { width: 100%; min-height: 40px; margin-top: 4px; padding: 0 10px; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-sm); color: var(--text); font-size: 15px; }
 .settings-view input[type="text"], .settings-view input[type="password"] { margin-bottom: 10px; }
+
+/* ---------- v1.1: mobile-first fixes for settings, balance chip, trades ---------- */
+html { -webkit-tap-highlight-color: transparent; }
+body { touch-action: manipulation; overscroll-behavior-y: none; }
+
+/* live balance chip in the top bar */
+.topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.bal-chip {
+  flex: none; display: inline-flex; align-items: center; min-height: 34px; padding: 0 12px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text); font-weight: 800; font-size: 14px;
+  text-decoration: none; font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.bal-chip.live { border-color: rgba(46, 207, 142, .5); color: var(--up); }
+.bal-chip.bad { border-color: rgba(255, 111, 125, .55); color: var(--down); }
+
+/* form fields: 16px text so iOS never zooms on focus, 46px+ tap targets */
+.fld { display: block; margin: 0 0 14px; min-width: 0; }
+.fld > span { display: block; font-size: 14px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+.fld > small { display: block; margin-top: 5px; font-size: 12px; color: var(--faint); font-weight: 500; }
+.fld input, .form-grid .fld input[type="text"] {
+  display: block; width: 100%; min-height: 46px; margin: 0; padding: 0 12px; font-size: 16px; font-weight: 600;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius-sm); color: var(--text); outline: none;
+}
+.fld input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(77, 163, 255, .18); }
+.form-grid .fld { margin: 0; font-size: inherit; color: inherit; font-weight: inherit; }
+.form-grid { gap: 14px; }
+.settings-view .fld input { margin-bottom: 0; }
+
+/* action rows */
+.actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
+.actions .btn { margin-top: 0; }
+.btn.small { min-height: 40px; }
+.trade-row .actions { margin-top: 10px; }
+.trade-row > b, .market-card > b { display: block; line-height: 1.35; overflow-wrap: anywhere; }
+.market-card .row span, .trade-row .row span { white-space: nowrap; }
+
+/* status pills + notes */
+.pill.warn { background: rgba(242, 184, 75, .14); color: var(--warn); }
+.pill.bad { background: var(--down-soft); color: var(--down); }
+.note { margin-top: 10px; padding: 10px 12px; border-radius: var(--radius-sm); font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+.note.bad { background: var(--down-soft); color: var(--down); border: 1px solid rgba(255, 111, 125, .35); }
+
+/* connection test results */
+.diag { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 8px; }
+.diag li { display: grid; gap: 2px; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--bg-2); border: 1px solid var(--line); font-size: 13px; overflow-wrap: anywhere; }
+.diag li b { font-size: 13px; }
+.diag li span { color: var(--muted); }
+.diag li.ok b { color: var(--up); }
+.diag li.bad { border-color: rgba(255, 111, 125, .4); }
+.diag li.bad b { color: var(--down); }
+
+.toasts { z-index: 80; }
+
+@media (min-width: 640px) { .form-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 380px) { .stat-grid b { font-size: 16px; } .bal-chip { padding: 0 10px; font-size: 13px; } }
+
+.hint.auto { color: var(--muted); }
+.fld input { scroll-margin-bottom: 120px; }

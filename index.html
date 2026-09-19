@@ -2,10 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'self' https://api.polymarket.us">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'self' https://api.polymarket.us https://gateway.polymarket.us">
   <meta name="referrer" content="no-referrer">
-  <meta name="blueedgeus-version" content="1.0.0">
+  <meta name="blueedgeus-version" content="1.1.0">
   <meta name="theme-color" content="#030B1A">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -14,14 +14,14 @@
   <link rel="icon" href="icon-192.png">
   <link rel="apple-touch-icon" href="icon-192.png">
   <title>BlueEdge US · Odds scalper</title>
-  <link rel="stylesheet" href="styles.css?v=us1">
+  <link rel="stylesheet" href="styles.css?v=us2">
 </head>
 <body>
   <div class="shell">
     <aside class="rail">
       <a class="brand" href="#home" aria-label="BlueEdge US home">
         <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 18 11 6l3 5 2-3 4 10z"/></svg></span>
-        <span class="brand-text"><b>BlueEdge US</b><small>Odds scalper · v1.0.0</small></span>
+        <span class="brand-text"><b>BlueEdge US</b><small>Odds scalper · v1.1.0</small></span>
       </a>
       <nav class="nav" aria-label="Main">
         <a href="#home"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg><span>Home</span></a>
@@ -36,17 +36,17 @@
         <span class="brand-mark small" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 18 11 6l3 5 2-3 4 10z"/></svg></span>
         <h1 id="navTitle">Home</h1>
       </div>
+      <a class="bal-chip" id="balChip" href="#settings" aria-label="Account balance">Connect</a>
     </header>
 
     <main class="main" id="app"></main>
   </div>
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
-  <script src="us-sdk.js?v=us1"></script>
-  <script src="strategy.js?v=us1"></script>
-  <script src="account.js?v=us1"></script>
-  <script src="app.js?v=us1"></script>
-  <script>
-    if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
-  </script>
+  <script src="us-sdk.js?v=us2"></script>
+  <script src="strategy.js?v=us2"></script>
+  <script src="account.js?v=us2"></script>
+  <script src="app.js?v=us2"></script>
+  <script src="pwa.js?v=us2"></script>
 </body>
 </html>

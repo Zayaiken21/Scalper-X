@@ -1,35 +1,39 @@
-/* BlueEdge US account: Polymarket US API key (Key ID + Ed25519 secret), encrypted on this device
- * behind a passcode — same PBKDF2-SHA256 + AES-GCM pattern the previous BlueEdge build used for
- * wallet keys. The secret never leaves this device unencrypted and is never sent anywhere except
- * as a signature (see us-sdk.js) attached to Polymarket US's own API calls.
+/* BlueEdge US account: Polymarket US API key (Key ID + Ed25519 secret), encrypted on this device behind a
+ * passcode (PBKDF2-SHA256 → AES-GCM). The secret never leaves this device unencrypted and is only ever used
+ * to sign requests to Polymarket US.
  */
 window.BlueEdgeAccount = (() => {
   const STORE = "blueedgeus.accounts.v1";
   const ITER = 310000;
   const enc = new TextEncoder(), dec = new TextDecoder();
-  const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+  const b64 = buf => { let s = ""; for (const b of new Uint8Array(buf)) s += String.fromCharCode(b); return btoa(s); };
   const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+  const num = v => { if (v == null || v === "") return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
+  const amt = a => (a != null && typeof a === "object") ? num(a.value) : num(a);
 
   const state = {
-    status: "none", message: "",             // none | locked | unlocked
-    account: null,                            // {id,label,keyId,updatedAt}
-    balance: null, buyingPower: null,
-    positions: [], orders: [], closed: [],
-    lastRefresh: 0, refreshing: false,
+    status: "none",                       // none | locked | unlocked
+    account: null,                        // {id,label,keyId,updatedAt}
+    balance: null, buyingPower: null, assetValue: null,
+    positions: [],                        // normalised: [{slug, qty, side, cost, cashValue, title}]
+    positionsAt: 0,                       // when positions were last fetched OK (used to reconcile bot trades)
+    orders: [],
+    health: { ok: null, message: "" },    // last refresh outcome
+    lastRefresh: 0, lastOk: 0,
   };
-  let sdk = null; // PolyUS.client(...) once unlocked
+  let sdk = null, inflight = null;
   const listeners = [];
   const on = fn => listeners.push(fn);
   const emit = () => listeners.forEach(fn => { try { fn(state); } catch (e) { console.error(e); } });
 
   /* ---------- store ---------- */
-  function readStore() { let s; try { s = JSON.parse(localStorage.getItem(STORE) || "null"); } catch {} if (!s) s = { active: null, list: [] }; s.list = Array.isArray(s.list) ? s.list : []; return s; }
+  function readStore() { let s = null; try { s = JSON.parse(localStorage.getItem(STORE) || "null"); } catch {} if (!s) s = { active: null, list: [] }; s.list = Array.isArray(s.list) ? s.list : []; return s; }
   function writeStore(s) { localStorage.setItem(STORE, JSON.stringify(s)); }
   const metaOf = r => r && ({ id: r.id, label: r.label, keyId: r.keyId, updatedAt: r.updatedAt });
-  const list = () => readStore().list.map(metaOf);
   const hasVault = () => readStore().list.length > 0;
+  function savedMeta() { const s = readStore(); return metaOf(s.list.find(r => r.id === s.active) || s.list[0]) || null; }
 
-  /* ---------- crypto (identical scheme to the crypto build's live.js) ---------- */
+  /* ---------- crypto ---------- */
   function needCrypto() { if (!window.crypto?.subtle) throw new Error("Secure storage needs HTTPS. Open BlueEdge US from its https:// address."); }
   async function deriveKey(passcode, salt) {
     needCrypto();
@@ -45,108 +49,128 @@ window.BlueEdgeAccount = (() => {
   async function openRecord(r, passcode) {
     const key = await deriveKey(passcode, unb64(r.kdf.salt));
     try { return JSON.parse(dec.decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(r.iv) }, key, unb64(r.ct)))); }
-    catch { throw new Error("Wrong passcode for this account."); }
+    catch { throw new Error("Wrong passcode."); }
   }
 
-  /* ---------- save / connect ---------- */
+  /* ---------- save / unlock ---------- */
   async function save({ label, keyId, secretKey, passcode }) {
     keyId = String(keyId || "").trim();
     secretKey = String(secretKey || "").replace(/\s+/g, "");
     if (!keyId) throw new Error("Enter your Polymarket US Key ID.");
     if (!secretKey) throw new Error("Enter your Polymarket US secret key.");
     if (!passcode || passcode.length < 4) throw new Error("Choose a passcode (4+ characters) to encrypt this key on your device.");
-    await PolyUS.importSecret(secretKey); // fail fast if it's not a usable Ed25519 secret, before we store anything
+    await PolyUS.importSecret(secretKey); // fail fast on an unusable secret, before anything is stored
     const sealed = await seal({ keyId, secretKey }, passcode);
-    const s = readStore();
     const id = "acc_" + Date.now().toString(36);
-    const rec = { id, label: label || "Polymarket US", keyId, updatedAt: Date.now(), ...sealed };
-    s.list.push(rec); s.active = id; writeStore(s);
+    // One account at a time: a fresh connect replaces any earlier (possibly mistyped) one.
+    writeStore({ active: id, list: [{ id, label: String(label || "").trim() || "Polymarket US", keyId, updatedAt: Date.now(), ...sealed }] });
     return unlock(id, passcode);
   }
 
   async function unlock(id, passcode) {
     const s = readStore();
-    const rec = s.list.find(r => r.id === id) || s.list[0];
+    const rec = s.list.find(r => r.id === (id || s.active)) || s.list[0];
     if (!rec) throw new Error("No saved account. Connect one first.");
+    if (!passcode) throw new Error("Enter your passcode.");
     const payload = await openRecord(rec, passcode);
     const cryptoKey = await PolyUS.importSecret(payload.secretKey);
     sdk = PolyUS.client(payload.keyId, cryptoKey);
     s.active = rec.id; writeStore(s);
-    state.status = "unlocked"; state.account = metaOf(rec); state.message = "";
+    state.status = "unlocked"; state.account = metaOf(rec);
+    state.health = { ok: null, message: "Connecting…" };
     emit();
-    refresh().catch(() => {});
+    await refresh().catch(() => {}); // first balance read happens before we return, so the UI shows real numbers immediately
     return state.account;
   }
 
-  function lock() { sdk = null; state.status = hasVault() ? "locked" : "none"; state.balance = null; state.positions = []; state.orders = []; emit(); }
-  function remove(id) {
-    const s = readStore(); s.list = s.list.filter(r => r.id !== id);
-    if (s.active === id) s.active = s.list[0]?.id || null;
-    writeStore(s);
-    if (state.account?.id === id) lock();
+  function lock() {
+    sdk = null; state.status = hasVault() ? "locked" : "none";
+    state.account = savedMeta();
+    Object.assign(state, { balance: null, buyingPower: null, assetValue: null, positions: [], positionsAt: 0, orders: [], lastRefresh: 0, lastOk: 0, health: { ok: null, message: "" } });
+    emit();
+  }
+  function remove() {
+    writeStore({ active: null, list: [] });
+    lock(); state.status = "none"; state.account = null; emit();
   }
   const isUnlocked = () => state.status === "unlocked" && !!sdk;
-  const canTrade = () => isUnlocked();
+  const client = () => sdk;
 
-  /* ---------- refresh ---------- */
-  async function refresh() {
-    if (!isUnlocked() || state.refreshing) return;
-    state.refreshing = true; emit();
-    try {
-      const [balRes, posRes, ordRes] = await Promise.allSettled([sdk.balances(), sdk.positions(), sdk.openOrders()]);
-      if (balRes.status === "fulfilled") {
-        const row = balRes.value?.balances?.[0];
-        if (row) { state.balance = Number(row.currentBalance) || 0; state.buyingPower = Number(row.buyingPower) || 0; }
-      } else state.message = balRes.reason?.message || "Couldn't load balance.";
-      if (posRes.status === "fulfilled") state.positions = posRes.value?.positions || posRes.value?.data || [];
-      if (ordRes.status === "fulfilled") state.orders = ordRes.value?.orders || ordRes.value?.data || [];
-      state.lastRefresh = Date.now();
-    } finally { state.refreshing = false; emit(); }
+  /* ---------- parsing helpers ---------- */
+  // The API returns positions as a map {marketSlug: position}; tolerate an array too.
+  function normalisePositions(raw) {
+    const entries = Array.isArray(raw) ? raw.map(p => [p?.marketMetadata?.slug || p?.marketSlug || p?.slug, p]) : Object.entries(raw || {});
+    const out = [];
+    for (const [slug, p] of entries) {
+      if (!slug || !p) continue;
+      const net = num(p.netPositionDecimal) ?? num(p.netPosition);
+      if (!net || Math.abs(net) < 1e-9 || p.expired) continue;
+      out.push({ slug, qty: Math.abs(net), side: net > 0 ? "YES" : "NO", cost: amt(p.cost), cashValue: amt(p.cashValue), title: p.marketMetadata?.title || p.marketMetadata?.outcome || slug });
+    }
+    return out;
+  }
+
+  // Turns a create-order / close-position response into something the bot can act on. A synchronous response
+  // holds several executions (NEW, then FILL...), so fills are summed rather than reading just the first.
+  function parseOrderResult(res) {
+    const ex = Array.isArray(res?.executions) ? res.executions : [];
+    const fills = ex.filter(e => /FILL$/.test(e.type || "") && num(e.lastShares) > 0);
+    const qty = fills.reduce((s, e) => s + num(e.lastShares), 0);
+    const px = qty > 0 ? fills.reduce((s, e) => s + num(e.lastShares) * (amt(e.lastPx) ?? 0), 0) / qty : null;
+    const rej = ex.find(e => e.type === "EXECUTION_TYPE_REJECTED");
+    const terminal = ex.some(e => /CANCELED|EXPIRED|REJECTED|DONE_FOR_DAY/.test(e.type || ""));
+    return {
+      id: res?.id || null, filledQty: qty, avgPx: px && px > 0 ? px : null,
+      rejected: !!rej, reason: rej ? (rej.text || (rej.orderRejectReason || "").replace("ORD_REJECT_REASON_", "").replace(/_/g, " ").toLowerCase() || "rejected") : "",
+      terminal, hadExecutions: ex.length > 0,
+    };
+  }
+
+  /* ---------- refresh (balance, positions, open orders) ---------- */
+  function refresh() {
+    if (!isUnlocked()) return Promise.resolve();
+    if (inflight) return inflight;
+    inflight = (async () => {
+      try {
+        const [balRes, posRes, ordRes] = await Promise.allSettled([sdk.balances(), sdk.positions(), sdk.openOrders()]);
+        state.lastRefresh = Date.now();
+        if (balRes.status === "fulfilled") {
+          const rows = balRes.value?.balances || [];
+          const row = rows.find(b => !b.currency || b.currency === "USD") || rows[0];
+          if (row) { state.balance = num(row.currentBalance) ?? 0; state.buyingPower = num(row.buyingPower) ?? 0; state.assetValue = num(row.assetNotional); }
+          state.lastOk = Date.now(); state.health = { ok: true, message: "" };
+        } else {
+          state.health = { ok: false, message: balRes.reason?.message || "Couldn't load balance." };
+        }
+        if (posRes.status === "fulfilled") { state.positions = normalisePositions(posRes.value?.positions); state.positionsAt = Date.now(); }
+        if (ordRes.status === "fulfilled") state.orders = ordRes.value?.orders || [];
+      } finally { inflight = null; emit(); }
+    })();
+    return inflight;
   }
 
   /* ---------- trading ---------- */
-  // side: "YES" (long) or "NO" (short). usd: dollar stake for a market buy.
+  function need() { if (!isUnlocked()) throw new Error("Unlock your Polymarket US account first."); }
+  // side: "YES" (long) or "NO" (short). usd: dollar stake. Market order, immediate-or-cancel, blocks until it resolves.
   async function buyMarket({ marketSlug, side, usd }) {
-    if (!isUnlocked()) throw new Error("Unlock your Polymarket US account first.");
-    const intent = side === "NO" ? "ORDER_INTENT_BUY_SHORT" : "ORDER_INTENT_BUY_LONG";
-    return sdk.createOrder({
-      marketSlug, intent, type: "ORDER_TYPE_MARKET",
-      cashOrderQty: { value: String(usd), currency: "USD" },
-      tif: "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
-      manualOrderIndicator: "MANUAL_ORDER_INDICATOR_AUTOMATIC",
-      synchronousExecution: true, maxBlockTime: "5",
+    need();
+    const res = await sdk.createOrder({
+      marketSlug, intent: side === "NO" ? "ORDER_INTENT_BUY_SHORT" : "ORDER_INTENT_BUY_LONG", type: "ORDER_TYPE_MARKET",
+      cashOrderQty: { value: String(usd), currency: "USD" }, tif: "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+      manualOrderIndicator: "MANUAL_ORDER_INDICATOR_AUTOMATIC", synchronousExecution: true, maxBlockTime: "5",
     });
+    return parseOrderResult(res);
   }
-  // Resting limit sell at a target price — the actual "scalp": exit once odds have risen enough.
-  async function sellLimit({ marketSlug, side, price, quantity }) {
-    if (!isUnlocked()) throw new Error("Unlock your Polymarket US account first.");
-    const intent = side === "NO" ? "ORDER_INTENT_SELL_SHORT" : "ORDER_INTENT_SELL_LONG";
-    return sdk.createOrder({
-      marketSlug, intent, type: "ORDER_TYPE_LIMIT",
-      price: { value: String(price), currency: "USD" },
-      quantity,
-      tif: "TIME_IN_FORCE_GOOD_TILL_CANCEL",
-      manualOrderIndicator: "MANUAL_ORDER_INDICATOR_AUTOMATIC",
-    });
+  // Sells the entire position in a market at market price (stop-loss, timeout, target hit, or manual close).
+  async function closeNow({ marketSlug }) {
+    need();
+    const res = await sdk.closePosition({ marketSlug, manualOrderIndicator: "MANUAL_ORDER_INDICATOR_AUTOMATIC", synchronousExecution: true, maxBlockTime: "5" });
+    return parseOrderResult(res);
   }
-  // Immediate market exit — used for stop-loss and max-hold timeouts, where getting out matters
-  // more than the exact price.
-  async function closeNow({ marketSlug, bips = 200 }) {
-    if (!isUnlocked()) throw new Error("Unlock your Polymarket US account first.");
-    return sdk.closePosition({ marketSlug, synchronousExecution: true, maxBlockTime: "5", slippageTolerance: { bips } });
-  }
-  async function cancelOrder(id) { if (!isUnlocked()) return; return sdk.cancelOrder(id); }
-  function marketsScan(params) { if (!isUnlocked()) throw new Error("Unlock your Polymarket US account first."); return sdk.markets(params); }
-  // Used when a held position's market has fallen out of the ranked scan window — we must always
-  // be able to see a price for anything we're holding, so we can still act on stop-loss/timeout.
-  function marketBySlug(slug) { if (!isUnlocked()) throw new Error("Unlock your Polymarket US account first."); return sdk.marketBySlug(slug); }
+  async function cancelAllOpen() { need(); return sdk.cancelAllOpen(); }
 
-  // boot: if a saved account exists, sit "locked" until the passcode is entered
   state.status = hasVault() ? "locked" : "none";
+  state.account = savedMeta();
 
-  return {
-    state, on, list, hasVault, save, unlock, lock, remove, refresh,
-    buyMarket, sellLimit, closeNow, cancelOrder, marketsScan, marketBySlug,
-    isUnlocked, canTrade,
-  };
+  return { state, on, savedMeta, hasVault, save, unlock, lock, remove, refresh, buyMarket, closeNow, cancelAllOpen, isUnlocked, client, parseOrderResult, normalisePositions };
 })();
