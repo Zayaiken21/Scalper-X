@@ -18,10 +18,10 @@
   let trades = (store.get(TRADES_KEY, []) || []).filter(t => t && t.marketSlug && t.status !== "failed");
   let botOn = false;                       // the bot always starts OFF after a reload — real money should never resume unattended
   let view = "home", botNote = "Bot is off.";
-  const scan = { rows: [], at: 0, error: "", liveError: "", scanning: false, horizonMs: S.HORIZONS[0], sum: null };
+  const scan = { rows: [], at: 0, error: "", scanning: false, horizonMs: Infinity, games: 0, sum: null };
   const bboCache = new Map();              // slug -> { q, at }: per-market price lookups, reused for 15s
   const drafts = {};                       // what the user has typed but not saved yet — survives any redraw
-  const ui = { busy: null, formError: "", diag: null, diagRunning: false, forgotOpen: false, connectNew: false, reveal: {} };
+  const ui = { busy: null, formError: "", diag: null, diagRunning: false, forgotOpen: false, connectNew: false, allowReset: true, reveal: {} };
   let entryFails = 0, entryPausedUntil = 0;
   const REFRESH_MS = 10000, SCAN_MS = 8000, TICK_MS = 2000, COOLDOWN_MS = 10 * 60000;
   // After any 429 the app halves its own polling for a minute, so it can never keep pushing against a limit.
@@ -51,42 +51,37 @@
 
   /* ---------- market data ---------- */
   const byVolume = (a, b) => (S.num(b.volume24hr) || 0) - (S.num(a.volume24hr) || 0);
-  async function fetchMarkets(horizonMs) {
-    const base = { limit: 100 };
-    const filtered = { ...base, active: true, closed: false };
-    if (Number.isFinite(horizonMs)) filtered.endDateMax = new Date(Date.now() + horizonMs).toISOString();
-    const pull = async params => { // if the server dislikes the sort field, retry unsorted rather than fail
-      try { return await PUB.markets({ ...params, orderBy: ["volume24hr"], orderDirection: "desc" }); }
-      catch (e) { if (!(e.status >= 400 && e.status < 500) || e.status === 429) throw e; return PUB.markets(params); }
-    };
-    let rows = (await pull(filtered))?.markets || [];
-    if (!rows.length) rows = (await pull(base))?.markets || []; // filters can be picky: an unfiltered list beats an empty one
-    return rows.filter(m => String(m.category || "").toLowerCase() !== "crypto").sort(byVolume);
-  }
-  // In-play games: the events endpoint knows which games are live right now (with score and period); their markets are
-  // nested inside. One request, and a failure here never breaks the rest of the scan.
+  // LIVE means a game that is being played right now — Polymarket's own "Live" tab (event.live === true), not every
+  // market on the platform. Each live game carries 200+ markets (props, spreads, totals); the scalper only needs the
+  // game's main line, so one row per game (per team for 3-way soccer) is kept. One list request, cached between scans.
   const scoreText = s => s == null ? "" : typeof s === "object" ? Object.values(s).filter(v => v != null && typeof v !== "object").join("–") : String(s);
   async function fetchLive() {
-    const pull = async params => (await PUB.events({ limit: 100, ...params }))?.events || [];
-    let evs;
-    try { evs = await pull({ live: true, active: true, closed: false }); }
-    catch (e) { if (!(e.status >= 400 && e.status < 500) || e.status === 429) throw e; evs = await pull({ live: true }); }
-    const out = [];
-    for (const ev of evs) {
-      if (ev.live !== true || ev.ended === true || String(ev.category || "").toLowerCase() === "crypto") continue; // trust the flag, not the filter
-      for (const m of ev.markets || []) if (m?.slug) out.push({ ...m, _live: true, _score: scoreText(ev.score), _period: ev.period ? String(ev.period) : "", _event: ev.title || "" });
+    const pull = async (params, offset) => (await PUB.events({ limit: 100, offset, ...params }))?.events || [];
+    const all = []; let mode = { live: true, active: true, closed: false };
+    for (let page = 0; page < 3; page++) { // 100 games per page; a third page only happens on very busy days
+      let evs;
+      try { evs = await pull(mode, page * 100); }
+      catch (e) {
+        if (page === 0 && mode.closed !== undefined && e.status >= 400 && e.status < 500 && e.status !== 429) { mode = { live: true }; evs = await pull(mode, 0); } // server disliked a filter: ask more simply
+        else throw e;
+      }
+      all.push(...evs); if (evs.length < 100) break;
     }
-    return out.sort(byVolume);
-  }
-  // In-play markets first (busiest first), then everything else by volume; a market in both lists appears once, marked live.
-  function withLive(live, rows) {
-    const liveSlugs = new Set(live.map(m => m.slug));
-    return live.concat(rows.filter(m => !liveSlugs.has(m.slug)).sort(byVolume));
+    const hasFlag = all.some(e => typeof e.live === "boolean"); // trust the flag itself, not just the server-side filter
+    const games = all.filter(e => (hasFlag ? e.live === true : true) && e.ended !== true && String(e.category || "").toLowerCase() !== "crypto");
+    const rows = [], seen = new Set();
+    for (const ev of games) {
+      for (const m of S.mainMarkets(ev.markets)) {
+        if (seen.has(m.slug)) continue; seen.add(m.slug);
+        rows.push({ ...m, _live: true, _score: scoreText(ev.score), _period: ev.period ? String(ev.period) : "", _clock: ev.elapsed ? String(ev.elapsed) : (ev.clock ? String(ev.clock) : ""), _event: ev.title || "" });
+      }
+    }
+    return { rows: rows.sort(byVolume), games: games.length };
   }
   // The list endpoint doesn't always carry live prices. For the busiest markets missing them, ask for the best bid/offer
   // directly — capped per pass and cached, so this stays a handful of requests, never a flood.
   async function fillQuotes(rows) {
-    let budget = 12;
+    let budget = 16;
     for (const m of rows) {
       if (S.validQuotes(S.quotesOf(m))) continue;
       let c = bboCache.get(m.slug);
@@ -98,21 +93,19 @@
       if (c.q) { m.bestBidQuote = c.q.bid; m.bestAskQuote = c.q.ask; if (c.q.bidDepth != null) m.bidDepth = c.q.bidDepth; if (c.q.askDepth != null) m.askDepth = c.q.askDepth; }
     }
   }
-  const pickHorizon = (rows, list) => list.find(h => S.scanForEntries(rows, cfg, new Set(), h).length >= 3);
-  // Markets closing soon first; widen the window only if there are too few worth buying. At most two list requests per pass.
+  const LIVE_MS = 30000, liveCache = { rows: [], games: 0, at: 0 };
+  // The live-game list is the heavy request, so it is refreshed every 30s (twice as slowly after any 429); per-market
+  // prices in between come from cached best-bid/offer lookups, and every buy is re-checked on a fresh quote first.
   async function runScan() {
     scan.scanning = true;
     try {
-      const live = await fetchLive().then(r => { scan.liveError = ""; return r; }).catch(e => { scan.liveError = e.message; return []; });
-      let rows = withLive(live, await fetchMarkets(S.HORIZONS[1])); await fillQuotes(rows);
-      let used = pickHorizon(rows, S.HORIZONS.slice(0, 2));
-      if (used === undefined) {
-        const wide = await fetchMarkets(Infinity), seen = new Set(rows.map(m => m.slug));
-        rows = withLive(live, rows.concat(wide.filter(m => !seen.has(m.slug)))); await fillQuotes(rows);
-        used = pickHorizon(rows, S.HORIZONS.slice(1)) ?? Infinity;
-      }
-      scan.rows = rows; scan.horizonMs = used; scan.at = Date.now(); scan.error = ""; scan.sum = S.summarize(rows, cfg, used);
-    } catch (e) { scan.error = e.message; scan.at = Date.now(); }
+      if (!liveCache.at || Date.now() - liveCache.at > LIVE_MS * slow()) { const r = await fetchLive(); Object.assign(liveCache, { rows: r.rows, games: r.games, at: Date.now() }); }
+      await fillQuotes(liveCache.rows);
+      scan.rows = liveCache.rows; scan.games = liveCache.games; scan.horizonMs = Infinity; scan.at = Date.now(); scan.error = ""; scan.sum = S.summarize(scan.rows, cfg, Infinity);
+    } catch (e) {
+      scan.error = e.message; scan.at = Date.now();
+      if (Date.now() - liveCache.at > 120000) scan.rows = []; // never keep trading off a list that has gone stale
+    }
     scan.scanning = false;
   }
   // Fresh YES-side quotes for one market: BBO first, falling back to the latest scan row.
@@ -272,11 +265,10 @@
   async function loop() { try { await tick(); } catch (e) { console.error(e); } setTimeout(loop, TICK_MS); }
 
   /* ---------- views ---------- */
-  const HORIZON_TEXT = { [S.HORIZONS[0]]: "closing within 3 hours", [S.HORIZONS[1]]: "closing within 24 hours", [S.HORIZONS[2]]: "closing within 7 days", [Infinity]: "of any closing date" };
   function autoLine() {
     const band = S.autoBand(S.scanForEntries(scan.rows, cfg, new Set(), scan.horizonMs));
-    if (!scan.at) return "The strategy picks the prices, targets and timing for you. It will show its chosen range here once it has scanned.";
-    return band ? `Strategy is buying between ${cents(band.min)} and ${cents(band.max)} right now, on markets ${HORIZON_TEXT[scan.horizonMs]}. Take-profit is set at 2× your stop loss.` : "Strategy is watching the market — nothing worth buying right now.";
+    if (!scan.at) return "The strategy trades live games only and picks the prices, targets and timing for you. It will show its chosen range once it has scanned.";
+    return band ? `Strategy is buying between ${cents(band.min)} and ${cents(band.max)} right now, on games being played now. Take-profit is set at 2× your stop loss.` : `Watching ${scan.games ?? 0} live games — nothing worth buying right now.`;
   }
   function homeView() {
     const open = trades.filter(t => t.status === "open");
@@ -324,8 +316,11 @@
     const q = S.quotesOf(m), ok = S.validQuotes(q), vol = S.num(m.volume24hr);
     const prices = ok ? `<span>YES ${cents(q.ask)}</span><span>NO ${cents(1 - q.bid)}</span><span>spread ${cents(q.ask - q.bid)}</span>` : `<span>price loading…</span>`;
     const buy = A.isUnlocked() && ok && !held ? `<div class="actions">${["YES", "NO"].map(side => `<button class="btn small ${pick?.side === side ? "primary" : ""}" data-act="manual-buy" data-slug="${esc(m.slug)}" data-side="${side}" ${ui.busy ? "disabled" : ""}>Buy ${side} · ${money(stake)}</button>`).join("")}</div>` : "";
-    return `<div class="market-card ${held ? "held" : ""}"><b>${esc(m.question || m.title || m.slug)}</b>
-      ${m._live ? `<span class="pill live">● LIVE${m._score ? ` · ${esc(m._score)}` : ""}${m._period ? ` · ${esc(m._period)}` : ""}</span>` : ""}
+    const title = m._event || m.question || m.title || m.slug, sub = m._event && m.question && m.question !== m._event ? m.question : "";
+    const state = [m._score, m._period, m._clock].filter(Boolean).map(esc).join(" · ");
+    return `<div class="market-card ${held ? "held" : ""}"><b>${esc(title)}</b>
+      ${sub ? `<small class="q">${esc(sub)}</small>` : ""}
+      <span class="pill live">● LIVE${state ? ` · ${state}` : ""}</span>
       ${pick ? `<span class="pill good" style="margin:6px 0 2px">Strategy pick: ${pick.side} at ${cents(pick.price)}</span>` : ""}
       <div class="row">${prices}${vol != null ? `<span>${Math.round(vol).toLocaleString()} traded/24h</span>` : ""}</div>${buy}</div>`;
   }
@@ -334,16 +329,13 @@
     for (const c of S.scanForEntries(scan.rows, cfg, new Set(), scan.horizonMs)) if (!picks.has(c.market.slug)) picks.set(c.market.slug, c);
     const held = new Set(trades.filter(openish).map(t => t.marketSlug));
     const sum = scan.sum, stake = S.stakeFor(cfg, A.state.buyingPower);
-    const byPick = (a, b) => (picks.has(b.slug) - picks.has(a.slug));
-    const liveRows = scan.rows.filter(m => m._live).sort(byPick), soon = scan.rows.filter(m => !m._live).sort(byPick);
-    const status = scan.error && !scan.rows.length ? "Couldn't load markets." : scan.at ? `${liveRows.length} live now · ${scan.rows.length} markets · ${sum?.withPrices ?? 0} with prices · ${picks.size} the strategy would buy` : "Loading live markets…";
+    const status = scan.error && !scan.rows.length ? "Couldn't load live games." : scan.at ? `${scan.games ?? 0} games live now · ${scan.rows.length} tradable lines · ${sum?.withPrices ?? 0} with prices · ${picks.size} the strategy would buy` : "Loading live games…";
     const head = `<div class="panel"><div class="block-head"><p class="hint" style="margin:0">${esc(status)}</p><button class="btn small" data-act="rescan" ${scan.scanning ? "disabled" : ""}>${scan.scanning ? "Loading…" : "Refresh"}</button></div>
       ${scan.error ? `<p class="note bad">${esc(scan.error)} <a href="#settings">Open Settings → Test connection</a> to see which step fails.</p>` : ""}
-      ${scan.liveError ? `<p class="note bad">Couldn't load in-play games: ${esc(scan.liveError)}</p>` : ""}
-      ${sum && scan.rows.length && !picks.size ? `<p class="hint">Nothing worth buying right now${sum.text ? ` — skipped: ${esc(sum.text)}` : ""}. You can still buy any market below by hand.</p>` : ""}</div>`;
-    if (!scan.rows.length) return head;
-    const section = (title, list, empty) => `<div class="block" style="margin-top:14px"><div class="block-head"><h2>${title} (${list.length})</h2></div>${list.length ? `<div class="market-grid">${list.map(m => marketRow(m, picks.get(m.slug), held.has(m.slug), stake)).join("")}</div>` : `<p class="hint">${empty}</p>`}</div>`;
-    return `${head}${section("Live now", liveRows.slice(0, 40), scan.at && !scan.liveError ? "No games are in play right now." : "Live games will show here.")}${section("Coming up", soon.slice(0, 25), "Nothing else scheduled soon.")}`;
+      <p class="hint" style="margin-bottom:0">Only games being played right now, busiest first. One line per game — the bot trades the main moneyline.</p>
+      ${sum && scan.rows.length && !picks.size ? `<p class="hint">Nothing worth buying right now${sum.text ? ` — skipped: ${esc(sum.text)}` : ""}. You can still buy any live game below by hand.</p>` : ""}</div>`;
+    if (!scan.rows.length) return `${head}${scan.at && !scan.error ? `<p class="hint" style="margin-top:12px">No games are being played right now.</p>` : ""}`;
+    return `${head}<div class="market-grid" style="margin-top:12px">${scan.rows.slice(0, 120).map(m => marketRow(m, picks.get(m.slug), held.has(m.slug), stake)).join("")}</div>`;
   }
 
   function tradeRow(t) {
@@ -416,9 +408,10 @@
         ${ui.formError ? `<p class="note bad">${esc(ui.formError)}</p>` : ""}
         <div class="actions"><button class="btn primary" data-act="unlock" ${busy ? "disabled" : ""}>${busy === "unlock" ? "Unlocking…" : "Unlock"}</button><button class="btn small danger" data-act="remove">Remove account</button></div>
         <details class="forgot" id="forgot" ${ui.forgotOpen ? "open" : ""}><summary>Forgot your passcode?</summary>
-          <p class="hint">Type the account name shown above, then tap Reset. That clears the saved copy on this device so you can reconnect with your Key ID and secret key and choose a new passcode. (The passcode is what locks your key, so it can't be looked up — your secret key is needed to set it up again.)</p>
-          <label class="fld"><span>Account name</span>${textIn("resetIn", "text", "Type the account name", "resetName", 'data-enter="reset-pass" enterkeyhint="go"')}</label>
-          <div class="actions"><button class="btn small danger" data-act="reset-pass">Reset passcode</button></div>
+          <p class="hint">Type the account name shown above and choose a new passcode. Your Key ID and secret key stay saved — nothing to re-enter.</p>
+          <label class="fld"><span>Account name</span>${textIn("resetIn", "text", "Type the account name", "resetName")}</label>
+          <label class="fld"><span>New passcode</span>${secretIn("newPassIn", "4+ characters", "newPass", 'data-enter="reset-pass" enterkeyhint="go"')}</label>
+          <div class="actions"><button class="btn small danger" data-act="reset-pass" ${busy ? "disabled" : ""}>${busy === "reset" ? "Resetting…" : "Reset & unlock"}</button></div>
         </details>
         ${diagBlock()}
       </div>`;
@@ -430,6 +423,8 @@
       <label class="fld"><span>Key ID</span>${textIn("keyIdIn", "text", "Paste your Key ID", "keyId")}</label>
       <label class="fld"><span>Secret key</span>${secretIn("secretIn", "Paste your secret key", "secret")}</label>
       <label class="fld"><span>Choose a passcode</span>${secretIn("passIn", "4+ characters — you enter this each session", "passcode", 'data-enter="connect" enterkeyhint="go"')}</label>
+      <label class="toggle-row"><input type="checkbox" data-act="toggle-allow-reset" ${ui.allowReset ? "checked" : ""}> Allow passcode reset with the account name</label>
+      <p class="hint" style="margin-top:0">${ui.allowReset ? "If you forget the passcode you can set a new one by typing this account's name. Anyone who can open this app on your device and knows the name could do the same — turn this off on a shared device." : "With this off, a forgotten passcode means removing the account and re-entering your Key ID and secret."}</p>
       ${ui.formError ? `<p class="note bad">${esc(ui.formError)}</p>` : ""}
       <div class="actions"><button class="btn primary" data-act="connect" ${busy ? "disabled" : ""}>${busy === "connect" ? "Connecting…" : "Connect"}</button>${ui.connectNew && A.hasVault() ? `<button class="btn small ghost" data-act="back-locked">Back</button>` : ""}<button class="btn small" data-act="diag" ${ui.diagRunning ? "disabled" : ""}>${ui.diagRunning ? "Testing…" : "Test connection"}</button></div>
       ${diagBlock()}
@@ -495,6 +490,8 @@
     const out = [];
     try { const r = await PUB.markets({ limit: 1, active: true }); const m0 = (r?.markets || [])[0]; const qq = m0 && S.quotesOf(m0); out.push({ ok: true, label: "Market data (gateway.polymarket.us)", detail: m0 ? `Reachable. Sample market has ${Object.keys(m0).length} fields (${Object.keys(m0).slice(0, 12).join(", ")}…); live prices ${S.validQuotes(qq) ? "included" : "not in the list, fetched per market"}.` : "Reachable, but returned no markets." }); }
     catch (e) { out.push({ ok: false, label: "Market data (gateway.polymarket.us)", detail: e.message }); }
+    try { const r = await fetchLive(); const kinds = [...new Set(r.rows.map(m => S.typeOf(m) || "untyped"))].slice(0, 6).join(", "); out.push({ ok: true, label: "Live games (events, live=true)", detail: `${r.games} games live now → ${r.rows.length} main lines kept. Market types: ${kinds || "none"}.` }); }
+    catch (e) { out.push({ ok: false, label: "Live games (events, live=true)", detail: e.message }); }
     if (A.isUnlocked()) {
       const sdk = A.client();
       try { const r = await sdk.balances(); const row = (r?.balances || [])[0]; out.push({ ok: true, label: "Signed request (api.polymarket.us)", detail: row ? `Cash ${money(S.num(row.currentBalance))}.` : "Signed OK, but no balance rows were returned." }); }
@@ -517,7 +514,7 @@
     },
     connect: () => guard("connect", async () => {
       ui.formError = "";
-      try { await A.save({ label: drafts.label, keyId: drafts.keyId, secretKey: drafts.secret, passcode: drafts.passcode }); ui.connectNew = false; ui.reveal = {}; for (const k of ["label", "keyId", "secret", "passcode"]) delete drafts[k]; botNote = "Bot is off."; toast("Connected.", "good"); location.hash = "#home"; }
+      try { await A.save({ label: drafts.label, keyId: drafts.keyId, secretKey: drafts.secret, passcode: drafts.passcode, allowReset: ui.allowReset }); ui.connectNew = false; ui.reveal = {}; for (const k of ["label", "keyId", "secret", "passcode"]) delete drafts[k]; botNote = "Bot is off."; toast("Connected.", "good"); location.hash = "#home"; }
       catch (e) { ui.formError = e.message; toast(e.message, "bad"); }
     }),
     unlock: () => guard("unlock", async () => {
@@ -525,16 +522,26 @@
       try { await A.unlock(null, drafts.unlockPass); delete drafts.unlockPass; botNote = "Bot is off."; toast("Unlocked.", "good"); }
       catch (e) { ui.formError = e.message; toast(e.message, "bad"); }
     }),
-    "reset-pass": () => {
+    "reset-pass": () => guard("reset", async () => {
+      const name = drafts.resetName, pass = drafts.newPass;
       try {
-        const rec = A.resetByName(drafts.resetName);
-        botOn = false; releaseWake();
-        Object.assign(drafts, { label: rec.label, keyId: rec.keyId }); delete drafts.resetName; delete drafts.unlockPass; delete drafts.secret; delete drafts.passcode;
-        Object.assign(ui, { connectNew: true, forgotOpen: false, formError: "", diag: null, reveal: {} });
-        toast("Passcode reset. Paste your secret key and choose a new passcode.", "good");
-      } catch (e) { toast(e.message, "bad"); }
-      render(true);
-    },
+        await A.resetPasscode(name, pass);
+        botOn = false; botNote = "Bot is off.";
+        for (const k of ["resetName", "newPass", "unlockPass"]) delete drafts[k];
+        Object.assign(ui, { forgotOpen: false, formError: "", reveal: {} });
+        toast("New passcode set. You're unlocked.", "good");
+      } catch (e) {
+        if (e.code !== "NO_RECOVERY") { toast(e.message, "bad"); return; }
+        // Saved before name-reset existed (or with it turned off): the only safe way back is re-entering the secret.
+        try {
+          const rec = A.resetByName(name);
+          Object.assign(drafts, { label: rec.label, keyId: rec.keyId }); for (const k of ["resetName", "newPass", "unlockPass", "secret", "passcode"]) delete drafts[k];
+          Object.assign(ui, { connectNew: true, forgotOpen: false, formError: "", diag: null, reveal: {} });
+          toast("This account has no reset copy, so paste your secret key once and choose a new passcode.", "bad");
+        } catch (e2) { toast(e2.message, "bad"); }
+      }
+    }),
+    "toggle-allow-reset": () => { ui.allowReset = !ui.allowReset; render(true); },
     "back-locked": () => { ui.connectNew = false; ui.formError = ""; render(true); },
     "toggle-reveal": el => { const k = el.dataset.key; ui.reveal[k] = !ui.reveal[k]; render(true); document.getElementById(el.dataset.target)?.focus(); },
     "clear-field": el => { drafts[el.dataset.key] = ""; render(true); document.getElementById(el.dataset.target)?.focus(); },
@@ -542,7 +549,7 @@
     remove: () => { if (!confirm("Remove the saved account from this device? You'll need your Key ID and secret to connect again.")) return; botOn = false; A.remove(); ui.connectNew = false; ui.diag = null; ui.formError = ""; render(true); },
     refresh: () => guard("refresh", async () => { await A.refresh(); toast(A.state.health.ok ? "Balance updated." : A.state.health.message, A.state.health.ok ? "good" : "bad"); }),
     diag: () => runDiagnostics(),
-    rescan: async () => { bboCache.clear(); await runScan(); render(true); },
+    rescan: async () => { bboCache.clear(); liveCache.at = 0; await runScan(); render(true); },
     "reset-cfg": () => { cfg = S.sanitize({}); for (const k of Object.keys(drafts)) if (k.startsWith("cfg:")) delete drafts[k]; saveCfg(); render(true); toast("Settings reset to defaults.", "good"); },
     "close-trade": el => guard("close", () => exclusive(async () => {
       const t = trades.find(x => x.id === el.dataset.id); if (!t || t.status !== "open") return;

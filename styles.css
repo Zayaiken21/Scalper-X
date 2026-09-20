@@ -807,3 +807,5 @@ details#rawBal pre { margin: 8px 0 0; padding: 12px; max-height: 260px; overflow
 .reveal-wrap .eye.clear { right: 64px; color: var(--muted); }
 details.forgot { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
 details.forgot summary { cursor: pointer; font-size: 14px; font-weight: 700; color: var(--accent); min-height: 40px; display: flex; align-items: center; }
+.market-card .q { display: block; margin: 2px 0 6px; font-size: 12px; font-weight: 500; color: var(--faint); overflow-wrap: anywhere; }
+.market-card .pill.live { margin: 4px 0 2px; }

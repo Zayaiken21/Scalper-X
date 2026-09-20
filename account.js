@@ -9,6 +9,7 @@ window.BlueEdgeAccount = (() => {
   const b64 = buf => { let s = ""; for (const b of new Uint8Array(buf)) s += String.fromCharCode(b); return btoa(s); };
   const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
   const num = v => { if (v == null || v === "") return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
+  const normName = s => String(s || "").trim().replace(/\s+/g, " ").toLowerCase();
   const amt = a => (a != null && typeof a === "object") ? num(a.value) : num(a);
 
   const state = {
@@ -54,7 +55,7 @@ window.BlueEdgeAccount = (() => {
   }
 
   /* ---------- save / unlock ---------- */
-  async function save({ label, keyId, secretKey, passcode }) {
+  async function save({ label, keyId, secretKey, passcode, allowReset = true }) {
     keyId = String(keyId || "").trim();
     secretKey = String(secretKey || "").replace(/\s+/g, "");
     if (!keyId) throw new Error("Enter your Polymarket US Key ID.");
@@ -62,10 +63,14 @@ window.BlueEdgeAccount = (() => {
     if (!passcode || passcode.length < 4) throw new Error("Choose a passcode (4+ characters) to encrypt this key on your device.");
     await PolyUS.importSecret(secretKey); // fail fast on an unusable secret, before anything is stored
     const sealed = await seal({ keyId, secretKey }, passcode);
+    const finalLabel = String(label || "").trim() || "Polymarket US";
+    // Optional recovery copy, locked with the account NAME instead of the passcode, so a forgotten passcode can be replaced
+    // by typing the name. Trade-off: anyone who can open this app on this device and knows the name can do the same.
+    const recovery = allowReset ? await seal({ keyId, secretKey }, normName(finalLabel)) : null;
     const id = "acc_" + Date.now().toString(36);
     // Never discard a saved account: only a record with the SAME Key ID is replaced (re-saving with a new passcode); any others are kept.
     const prior = readStore();
-    writeStore({ active: id, list: [...prior.list.filter(r => r.keyId !== keyId), { id, label: String(label || "").trim() || "Polymarket US", keyId, updatedAt: Date.now(), ...sealed }] });
+    writeStore({ active: id, list: [...prior.list.filter(r => r.keyId !== keyId), { id, label: finalLabel, keyId, updatedAt: Date.now(), ...sealed, ...(recovery ? { recovery } : { noRecovery: true }) }] });
     return unlock(id, passcode);
   }
 
@@ -77,6 +82,7 @@ window.BlueEdgeAccount = (() => {
     const payload = await openRecord(rec, passcode);
     const cryptoKey = await PolyUS.importSecret(payload.secretKey);
     sdk = PolyUS.client(payload.keyId, cryptoKey);
+    if (!rec.recovery && !rec.noRecovery) rec.recovery = await seal(payload, normName(rec.label)); // accounts saved before name-reset existed get a recovery copy now
     s.active = rec.id; writeStore(s);
     state.status = "unlocked"; state.account = metaOf(rec);
     state.health = { ok: null, message: "Connecting…" };
@@ -98,7 +104,6 @@ window.BlueEdgeAccount = (() => {
   // Forgot-passcode reset. The passcode is the encryption key for the saved API secret, so it can't be recovered or
   // bypassed. Typing the account's name only removes that one encrypted copy from this device; getting back in still
   // needs the Key ID + secret key, which the person re-enters and re-encrypts under a new passcode.
-  const normName = s => String(s || "").trim().replace(/\s+/g, " ").toLowerCase();
   function resetByName(name) {
     const want = normName(name);
     if (!want) throw new Error("Type the account name to reset it.");
@@ -106,6 +111,20 @@ window.BlueEdgeAccount = (() => {
     if (!rec) throw new Error("That name doesn't match the saved account.");
     s.list = s.list.filter(r => r.id !== rec.id); s.active = s.list[0]?.id || null; writeStore(s);
     const meta = metaOf(rec); lock(); return meta;
+  }
+  // New passcode from the account name alone: the recovery copy opens with the name, then the secret is re-locked under the
+  // new passcode. Nothing to re-enter. Accounts without a recovery copy get code NO_RECOVERY.
+  async function resetPasscode(name, newPasscode) {
+    const want = normName(name);
+    if (!want) throw new Error("Type the account name.");
+    if (!newPasscode || newPasscode.length < 4) throw new Error("Choose a new passcode (4+ characters).");
+    const s = readStore(), rec = s.list.find(r => normName(r.label) === want);
+    if (!rec) throw new Error("That name doesn't match the saved account.");
+    if (!rec.recovery) { const e = new Error("This account has no reset copy on this device."); e.code = "NO_RECOVERY"; throw e; }
+    let payload; try { payload = await openRecord(rec.recovery, want); } catch { throw new Error("That name doesn't match the saved account."); }
+    const sealed = await seal(payload, newPasscode);
+    Object.assign(rec, sealed, { updatedAt: Date.now() }); s.active = rec.id; writeStore(s);
+    return unlock(rec.id, newPasscode);
   }
   const isUnlocked = () => state.status === "unlocked" && !!sdk;
   const client = () => sdk;
@@ -211,5 +230,5 @@ window.BlueEdgeAccount = (() => {
   state.status = hasVault() ? "locked" : "none";
   state.account = savedMeta();
 
-  return { state, on, savedMeta, hasVault, save, unlock, lock, remove, resetByName, refresh, buyMarket, closeNow, cancelAllOpen, isUnlocked, client, parseOrderResult, normalisePositions, parseBalance };
+  return { state, on, savedMeta, hasVault, save, unlock, lock, remove, resetByName, resetPasscode, refresh, buyMarket, closeNow, cancelAllOpen, isUnlocked, client, parseOrderResult, normalisePositions, parseBalance };
 })();

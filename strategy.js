@@ -174,5 +174,19 @@ window.BlueEdgeStrategy = (() => {
     return Math.max(1, Math.min(cfg.stakeUsd, Math.floor((buyingPower ?? cfg.stakeUsd) * 0.9)));
   }
 
-  return { HORIZONS, DEFAULTS, LIMITS, plan, sanitize, validateField, quotesOf, validQuotes, sidesFromQuotes, candidateSides, classify, summarize, REASONS, scanForEntries, autoBand, exitPrice, entryPrice, evaluateExit, fillPxForSide, fee, netPnl, stakeFor, amt, num };
+  // A live game lists 200+ markets (props, spreads, totals, halves). Only the game's main line is worth scalping:
+  // the full-game winner / moneyline (Polymarket US `sportsMarketType`). Older markets may lack the type, so fall back to
+  // the busiest plain two-sided market that isn't obviously a prop or a period line.
+  const MAIN_TYPE = /^(moneyline|(basketball|football|baseball|hockey|lacrosse)_team_full_game_winner|soccer_team_full_time_winner|soccer_game_to_advance|(tennis|cricket|esports|boxing|darts|pickleball|table_tennis)_match_winner|ufc_fight_winner)$/;
+  const typeOf = m => String(m?.sportsMarketType || m?.sports?.sportsMarketType || m?.sportsMarketTypeV2 || m?.marketType || "").toLowerCase();
+  const byVol = (a, b) => (num(b.volume24hr) || 0) - (num(a.volume24hr) || 0);
+  function mainMarkets(markets) {
+    const open = (markets || []).filter(m => m && m.slug && m.active !== false && m.closed !== true && m.archived !== true);
+    const mains = open.filter(m => MAIN_TYPE.test(typeOf(m)));
+    if (mains.length) return mains.sort(byVol).slice(0, 3); // 3 only for 3-way soccer (one Yes/No line per team + draw)
+    const plain = open.filter(m => Array.isArray(m.marketSides) && m.marketSides.length === 2 && !/prop|spread|total|half|quarter|inning|set_|map_|game_winner_|player|first_|next_|exact|margin|overtime/.test(typeOf(m)));
+    return plain.sort(byVol).slice(0, 1);
+  }
+
+  return { mainMarkets, typeOf, HORIZONS, DEFAULTS, LIMITS, plan, sanitize, validateField, quotesOf, validQuotes, sidesFromQuotes, candidateSides, classify, summarize, REASONS, scanForEntries, autoBand, exitPrice, entryPrice, evaluateExit, fillPxForSide, fee, netPnl, stakeFor, amt, num };
 })();
