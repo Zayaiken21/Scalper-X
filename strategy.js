@@ -101,7 +101,7 @@ window.BlueEdgeStrategy = (() => {
       if (m.marketSides.length > 2) return { reason: "multiSided" };
       if (m.marketSides.some(s => s.tradable === false)) return { reason: "inactive" };
     }
-    if (m._live && m.endDate) { const t = Date.parse(m.endDate); if (Number.isFinite(t) && t - Date.now() > 36 * 3600000) return { reason: "notToday" }; } // a live line dated beyond today is a future, not this game
+    if (m._live && m.endDate && !m._mainByType) { const t = Date.parse(m.endDate); if (Number.isFinite(t) && t - Date.now() > 36 * 3600000) return { reason: "notToday" }; } // only distrust endDate for the fallback guess, never for a line confirmed by sportsMarketType
     if (m.endDate && !m._live) { const t = Date.parse(m.endDate); if (Number.isFinite(t) && t - Date.now() > horizonMs) return { reason: "farFuture" }; } // a past endDate is fine: live games can carry their scheduled time
     const pl = plan(cfg), vol = num(m.volume24hr);
     if (vol != null && vol < pl.minVolume) return { reason: "lowVolume" };
@@ -181,13 +181,17 @@ window.BlueEdgeStrategy = (() => {
   const MAIN_TYPE = /^(moneyline|(basketball|football|baseball|hockey|lacrosse)_team_full_game_winner|soccer_team_full_time_winner|soccer_game_to_advance|(tennis|cricket|esports|boxing|darts|pickleball|table_tennis)_match_winner|ufc_fight_winner)$/;
   const typeOf = m => String(m?.sportsMarketType || m?.sports?.sportsMarketType || m?.sportsMarketTypeV2 || m?.marketType || "").toLowerCase();
   const byVol = (a, b) => (num(b.volume24hr) || 0) - (num(a.volume24hr) || 0);
+  const isMainType = m => MAIN_TYPE.test(typeOf(m));
   function mainMarkets(markets) {
     const open = (markets || []).filter(m => m && m.slug && m.active !== false && m.closed !== true && m.archived !== true);
-    const mains = open.filter(m => MAIN_TYPE.test(typeOf(m)));
-    if (mains.length) return mains.sort(byVol).slice(0, 3); // 3 only for 3-way soccer (one Yes/No line per team + draw)
+    const mains = open.filter(isMainType);
+    // Tag these as confirmed-by-type so downstream endDate sanity checks (meant only to catch the
+    // fallback guess below) never reject a real full-game-winner line just because Polymarket's
+    // endDate on that market sits outside a 36h window (settlement windows, doubleheaders, series games, etc).
+    if (mains.length) { for (const m of mains) m._mainByType = true; return mains.sort(byVol).slice(0, 3); } // 3 only for 3-way soccer (one Yes/No line per team + draw)
     const plain = open.filter(m => Array.isArray(m.marketSides) && m.marketSides.length === 2 && !/prop|spread|total|half|quarter|inning|set_|map_|game_winner_|player|first_|next_|exact|margin|overtime/.test(typeOf(m)));
     return plain.sort(byVol).slice(0, 1);
   }
 
-  return { mainMarkets, typeOf, HORIZONS, DEFAULTS, LIMITS, plan, sanitize, validateField, quotesOf, validQuotes, sidesFromQuotes, candidateSides, classify, summarize, REASONS, scanForEntries, autoBand, exitPrice, entryPrice, evaluateExit, fillPxForSide, fee, netPnl, stakeFor, amt, num };
+  return { mainMarkets, isMainType, typeOf, HORIZONS, DEFAULTS, LIMITS, plan, sanitize, validateField, quotesOf, validQuotes, sidesFromQuotes, candidateSides, classify, summarize, REASONS, scanForEntries, autoBand, exitPrice, entryPrice, evaluateExit, fillPxForSide, fee, netPnl, stakeFor, amt, num };
 })();

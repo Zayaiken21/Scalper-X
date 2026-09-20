@@ -102,7 +102,10 @@
       if (ev.live !== true || ev.ended === true || String(ev.category || "").toLowerCase() === "crypto") continue;
       const g = stateOf(ev);
       if (g.start && g.start > now + 120000) { hidden.future++; continue; }      // flagged live but the start time is still ahead
-      const mains = S.mainMarkets(ev.markets).filter(m => { const end = Date.parse(m.endDate || ""); if (Number.isFinite(end) && end - now > 36 * 3600000) { hidden.farEnd++; return false; } return true; }); // futures / later-dated lines are not today's game
+      // A line confirmed as the real full-game-winner market by sportsMarketType is trusted regardless of its
+      // endDate (Polymarket's settlement window can run well past 36h even for today's game). The endDate
+      // sanity check only applies to the untyped fallback guess in S.mainMarkets, to keep out genuine futures.
+      const mains = S.mainMarkets(ev.markets).filter(m => { if (m._mainByType) return true; const end = Date.parse(m.endDate || ""); if (Number.isFinite(end) && end - now > 36 * 3600000) { hidden.farEnd++; return false; } return true; });
       if (!mains.length) continue;
       games++; gameInfo.set(ev.slug, g);
       if (!sample && (ev.score || ev.period)) sample = { slug: ev.slug, live: ev.live, score: ev.score, period: ev.period, elapsed: ev.elapsed, startTime: ev.startTime, sides: (mains[0].marketSides || []).map(x => ({ team: x.team?.name || x.description, long: x.long, ordering: x.team?.ordering })) };
@@ -168,10 +171,18 @@
     scan.scanning = false;
   }
   // Fresh YES-side quotes for one market: BBO first, falling back to the latest scan row.
+  // inflight de-dupes concurrent callers hitting the same slug in one pass (e.g. two open trades on the
+  // same game) so exit management never doubles up on requests the rate limiter would otherwise have to queue.
+  const inflightBbo = new Map();
   async function quotesFor(slug) {
-    try { const q = S.quotesOf(await PUB.bbo(slug)); if (S.validQuotes(q)) return q; } catch {}
-    const row = scan.rows.find(m => m.slug === slug); const q = row && S.quotesOf(row);
-    return S.validQuotes(q) ? q : null;
+    let p = inflightBbo.get(slug);
+    if (!p) {
+      p = (async () => { try { const q = S.quotesOf(await PUB.bbo(slug)); return S.validQuotes(q) ? q : null; } catch { return null; } })();
+      inflightBbo.set(slug, p); p.finally(() => inflightBbo.delete(slug));
+    }
+    const q = await p; if (q) return q;
+    const row = scan.rows.find(m => m.slug === slug); const rq = row && S.quotesOf(row);
+    return S.validQuotes(rq) ? rq : null;
   }
 
   /* ---------- text helpers ---------- */
