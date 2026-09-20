@@ -117,6 +117,7 @@ window.PolyUS = (() => {
       markets: params => get("/v1/markets", params),
       events: params => http(GATEWAY, "GET", "/v1/events", { query: params, timeoutMs: 30000 }), // carries the live flag, score and period for in-play sports; large, so a longer timeout
       marketBySlug: slug => get(`/v1/market/slug/${enc1(slug)}`),
+      eventBySlug: slug => get(`/v1/events/slug/${enc1(slug)}`), // one game: live flag, score, period, clock
       bbo: slug => get(`/v1/markets/${enc1(slug)}/bbo`),
     };
   }

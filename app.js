@@ -51,32 +51,91 @@
 
   /* ---------- market data ---------- */
   const byVolume = (a, b) => (S.num(b.volume24hr) || 0) - (S.num(a.volume24hr) || 0);
-  // LIVE means a game that is being played right now — Polymarket's own "Live" tab (event.live === true), not every
-  // market on the platform. Each live game carries 200+ markets (props, spreads, totals); the scalper only needs the
-  // game's main line, so one row per game (per team for 3-way soccer) is kept. One list request, cached between scans.
-  const scoreText = s => s == null ? "" : typeof s === "object" ? Object.values(s).filter(v => v != null && typeof v !== "object").join("–") : String(s);
+  /* ---------- personalisation + live game state ---------- */
+  const PREFS_KEY = "blueedgeus.prefs";
+  const prefs = { leagues: [], skipBreaks: true, ...(store.get(PREFS_KEY, {}) || {}) };
+  if (!Array.isArray(prefs.leagues)) prefs.leagues = [];
+  const savePrefs = () => store.set(PREFS_KEY, { leagues: prefs.leagues, skipBreaks: !!prefs.skipBreaks });
+  const leagueOk = m => !prefs.leagues.length || prefs.leagues.includes(m._league);
+  const gameInfo = new Map();            // event slug -> latest live state {live, ended, score, period, clock, start, at}
+  const BREAK_RE = /^(ht\b|half\s*-?\s*time|end\b|ft\b|final|break|intermission|delay|suspended|postponed|stopped)/i;
+  const isBreak = p => BREAK_RE.test(String(p || "").trim());
+  const PERIODS = { "1h": "1st half", "2h": "2nd half", ht: "Halftime", ft: "Final", "ft ot": "Final (OT)", "ft nr": "Final (no result)" };
+  const periodText = p => { const t = String(p || "").trim(); return PERIODS[t.toLowerCase()] || t; };
+  const scoreText = s => s == null ? "" : typeof s === "object" ? Object.values(s).filter(v => v != null && typeof v !== "object").join("–") : String(s).replace(/\s*-\s*/, "–");
+  const stateOf = ev => ({ live: ev.live === true, ended: ev.ended === true, score: scoreText(ev.score), period: ev.period ? String(ev.period) : "", clock: ev.elapsed ? String(ev.elapsed) : (ev.clock ? String(ev.clock) : ""), start: Date.parse(ev.startTime || ev.startDate || "") || null, at: Date.now() });
+  // Which team is YES: the side flagged long. Names are only used when both sides carry a team, so a label is never guessed.
+  function sidesOf(m) {
+    const ss = Array.isArray(m?.marketSides) ? m.marketSides : [];
+    const long = ss.find(x => x.long === true), short = ss.find(x => x.long === false);
+    const nm = x => String(x?.team?.name || x?.team?.safeName || x?.description || "").trim();
+    return { yes: nm(long), no: nm(short), named: !!(long?.team && short?.team && nm(long) && nm(short)) };
+  }
+  const pickName = (m, side) => { const s = sidesOf(m); return s.named ? (side === "NO" ? s.no : s.yes) : side; };
+  const leagueOf = (ev, m) => String((m.marketSides || []).map(x => x.team?.league).find(Boolean) || ev.seriesSlug || String(ev.slug || "").split("-")[0] || "Other").toUpperCase();
+  function liveBadge(g) {
+    if (!g) return "";
+    if (g.ended) return `<span class="pill bad">Game over${g.score ? ` · ${esc(g.score)}` : ""}</span>`;
+    if (!g.live) return `<span class="pill warn">Not live</span>`;
+    const bits = [periodText(g.period), g.clock, g.score ? `Score ${g.score}` : ""].filter(Boolean).map(esc).join(" · ");
+    return `<span class="pill live">● LIVE${bits ? ` · ${bits}` : ""}</span><span class="age" data-ts="${g.at}"></span>`;
+  }
+
+  // LIVE means a game being played right now — Polymarket's own "Live" tab (event.live === true) — never every market on the
+  // platform. A live game lists 200+ markets (props, spreads, halves); only its main line is kept. One list request, cached.
   async function fetchLive() {
     const pull = async (params, offset) => (await PUB.events({ limit: 100, offset, ...params }))?.events || [];
     const all = []; let mode = { live: true, active: true, closed: false };
-    for (let page = 0; page < 3; page++) { // 100 games per page; a third page only happens on very busy days
+    for (let page = 0; page < 3; page++) {
       let evs;
       try { evs = await pull(mode, page * 100); }
       catch (e) {
-        if (page === 0 && mode.closed !== undefined && e.status >= 400 && e.status < 500 && e.status !== 429) { mode = { live: true }; evs = await pull(mode, 0); } // server disliked a filter: ask more simply
+        if (page === 0 && mode.closed !== undefined && e.status >= 400 && e.status < 500 && e.status !== 429) { mode = { live: true }; evs = await pull(mode, 0); }
         else throw e;
       }
       all.push(...evs); if (evs.length < 100) break;
     }
-    const hasFlag = all.some(e => typeof e.live === "boolean"); // trust the flag itself, not just the server-side filter
-    const games = all.filter(e => (hasFlag ? e.live === true : true) && e.ended !== true && String(e.category || "").toLowerCase() !== "crypto");
-    const rows = [], seen = new Set();
-    for (const ev of games) {
-      for (const m of S.mainMarkets(ev.markets)) {
+    // Fail closed: with no live flag on the events there is no way to know what is in play, so show and trade nothing.
+    if (all.length && !all.some(e => typeof e.live === "boolean")) throw new Error("Polymarket's game list didn't say which games are live, so nothing is shown or traded.");
+    const now = Date.now(), hidden = { future: 0, farEnd: 0 }, rows = [], seen = new Set(); let games = 0, sample = null;
+    for (const ev of all) {
+      if (ev.live !== true || ev.ended === true || String(ev.category || "").toLowerCase() === "crypto") continue;
+      const g = stateOf(ev);
+      if (g.start && g.start > now + 120000) { hidden.future++; continue; }      // flagged live but the start time is still ahead
+      const mains = S.mainMarkets(ev.markets).filter(m => { const end = Date.parse(m.endDate || ""); if (Number.isFinite(end) && end - now > 36 * 3600000) { hidden.farEnd++; return false; } return true; }); // futures / later-dated lines are not today's game
+      if (!mains.length) continue;
+      games++; gameInfo.set(ev.slug, g);
+      if (!sample && (ev.score || ev.period)) sample = { slug: ev.slug, live: ev.live, score: ev.score, period: ev.period, elapsed: ev.elapsed, startTime: ev.startTime, sides: (mains[0].marketSides || []).map(x => ({ team: x.team?.name || x.description, long: x.long, ordering: x.team?.ordering })) };
+      for (const m of mains) {
         if (seen.has(m.slug)) continue; seen.add(m.slug);
-        rows.push({ ...m, _live: true, _score: scoreText(ev.score), _period: ev.period ? String(ev.period) : "", _clock: ev.elapsed ? String(ev.elapsed) : (ev.clock ? String(ev.clock) : ""), _event: ev.title || "" });
+        rows.push({ ...m, _live: true, _eventSlug: ev.slug, _league: leagueOf(ev, m), _event: ev.title || "" });
       }
     }
-    return { rows: rows.sort(byVolume), games: games.length };
+    return { rows: rows.sort(byVolume), games, hidden, sample };
+  }
+  async function fetchGame(slug) { // one game's fresh state (score, period, clock, live flag)
+    const r = await PUB.eventBySlug(slug), ev = r?.event || r;
+    if (!ev || typeof ev.live !== "boolean") throw new Error("no live flag in the reply");
+    const g = stateOf(ev); gameInfo.set(slug, g); return g;
+  }
+  // The gate in front of every buy, bot or manual: the game must be live RIGHT NOW according to Polymarket, checked fresh.
+  async function confirmLive(row, { manual } = {}) {
+    const slug = row?._eventSlug;
+    if (!slug) return { ok: false, why: "Couldn't identify the game for this market." };
+    let g = gameInfo.get(slug);
+    if (!g || Date.now() - g.at > 8000) { try { g = await fetchGame(slug); } catch (e) { return { ok: false, why: `Couldn't confirm the game is live (${e.message}).` }; } }
+    if (g.ended) return { ok: false, why: "That game is over." };
+    if (!g.live) return { ok: false, why: "That game isn't live right now." };
+    if (g.start && g.start > Date.now() + 120000) return { ok: false, why: "That game hasn't started yet." };
+    if (!manual && prefs.skipBreaks && isBreak(g.period)) return { ok: false, why: `Skipping the break (${periodText(g.period)}).`, soft: true };
+    return { ok: true, g };
+  }
+  // Keeps score/period/clock current for the games you hold trades in (one small request per game, at most every 12s).
+  async function refreshGames() {
+    for (const slug of new Set(trades.filter(openish).map(t => t.eventSlug).filter(Boolean))) {
+      const g = gameInfo.get(slug); if (g && Date.now() - g.at < 12000 * slow()) continue;
+      try { await fetchGame(slug); } catch {}
+    }
   }
   // The list endpoint doesn't always carry live prices. For the busiest markets missing them, ask for the best bid/offer
   // directly — capped per pass and cached, so this stays a handful of requests, never a flood.
@@ -93,13 +152,13 @@
       if (c.q) { m.bestBidQuote = c.q.bid; m.bestAskQuote = c.q.ask; if (c.q.bidDepth != null) m.bidDepth = c.q.bidDepth; if (c.q.askDepth != null) m.askDepth = c.q.askDepth; }
     }
   }
-  const LIVE_MS = 30000, liveCache = { rows: [], games: 0, at: 0 };
+  const LIVE_MS = 30000, liveCache = { rows: [], games: 0, hidden: {}, sample: null, at: 0 };
   // The live-game list is the heavy request, so it is refreshed every 30s (twice as slowly after any 429); per-market
   // prices in between come from cached best-bid/offer lookups, and every buy is re-checked on a fresh quote first.
   async function runScan() {
     scan.scanning = true;
     try {
-      if (!liveCache.at || Date.now() - liveCache.at > LIVE_MS * slow()) { const r = await fetchLive(); Object.assign(liveCache, { rows: r.rows, games: r.games, at: Date.now() }); }
+      if (!liveCache.at || Date.now() - liveCache.at > LIVE_MS * slow()) { const r = await fetchLive(); Object.assign(liveCache, { rows: r.rows, games: r.games, hidden: r.hidden, sample: r.sample, at: Date.now() }); }
       await fillQuotes(liveCache.rows);
       scan.rows = liveCache.rows; scan.games = liveCache.games; scan.horizonMs = Infinity; scan.at = Date.now(); scan.error = ""; scan.sum = S.summarize(scan.rows, cfg, Infinity);
     } catch (e) {
@@ -191,8 +250,8 @@
 
   // Places one buy and tracks it write-ahead: the trade is recorded BEFORE the order goes out, so a lost reply
   // (network drop, timeout) can never leave an untracked position — reconcile() finds it from the exchange.
-  async function openTrade({ marketSlug, question, side, expectedPx, usd, manual }) {
-    const t = { id: uid(), marketSlug, question, side, entry: expectedPx, quantity: null, stake: usd, openedAt: Date.now(), status: "pending", manual: !!manual };
+  async function openTrade({ marketSlug, question, side, expectedPx, usd, manual, eventSlug, pick, league }) {
+    const t = { id: uid(), marketSlug, question, side, entry: expectedPx, quantity: null, stake: usd, openedAt: Date.now(), status: "pending", manual: !!manual, eventSlug: eventSlug || null, pick: pick || side, league: league || "" };
     trades.push(t); saveTrades();
     const drop = () => { trades = trades.filter(x => x !== t); saveTrades(); };
     try {
@@ -221,34 +280,41 @@
     if (cfg.dailyLossLimit > 0 && todayPnl() <= -cfg.dailyLossLimit) { botNote = `Daily loss limit reached (${money(todayPnl())}). No new entries today — open trades still exit normally.`; return; }
     const slots = cfg.maxOpen - trades.filter(openish).length;
     if (slots <= 0) { botNote = `Holding ${cfg.maxOpen} of ${cfg.maxOpen} positions.`; return; }
-    if (!scan.rows.length) { botNote = scan.error ? `Market data problem: ${scan.error}` : "Waiting for the first market scan…"; return; }
+    const rows = scan.rows.filter(leagueOk);
+    if (!rows.length) { botNote = scan.error ? `Market data problem: ${scan.error}` : !scan.at ? "Waiting for the first market scan…" : prefs.leagues.length ? `No live ${prefs.leagues.join(" / ")} games right now.` : "No games are being played right now."; return; }
     const skip = new Set([
       ...trades.filter(openish).map(t => t.marketSlug),
       ...A.state.positions.map(p => p.slug), // never stack onto positions you opened yourself
       ...trades.filter(t => t.status === "closed" && now - t.closedAt < COOLDOWN_MS).map(t => t.marketSlug), // no instant re-entry after an exit
     ]);
-    const cands = S.scanForEntries(scan.rows, cfg, skip, scan.horizonMs);
-    if (!cands.length) { botNote = `Watching ${scan.rows.length} markets, none worth buying yet${scan.sum?.text ? ` (${scan.sum.text})` : ""}.`; return; }
+    const busyGames = new Set(trades.filter(openish).map(t => t.eventSlug).filter(Boolean)); // one trade per game at a time
+    let cands = S.scanForEntries(rows, cfg, skip, scan.horizonMs).filter(c => !busyGames.has(c.market._eventSlug));
+    if (prefs.skipBreaks) cands = cands.filter(c => { const g = gameInfo.get(c.market._eventSlug); return !(g && isBreak(g.period)); });
+    if (!cands.length) { botNote = `Watching ${new Set(rows.map(m => m._eventSlug)).size} live games, none worth buying yet${scan.sum?.text ? ` (${scan.sum.text})` : ""}.`; return; }
     let placed = 0, tried = 0, lastErr = "";
     for (const c of cands) {
       if (placed >= slots || tried >= slots + 2) break;
+      if (busyGames.has(c.market._eventSlug)) continue;
       const stake = S.stakeFor(cfg, A.state.buyingPower);
       if ((A.state.buyingPower ?? 0) < stake) { botNote = `Paused: buying power ${money(A.state.buyingPower)} is below the ${money(stake)} stake.`; return; }
       tried++;
       const q = await quotesFor(c.market.slug); // re-verify on a fresh quote and a live book right before spending money
       const fresh = q && S.sidesFromQuotes(q, cfg).find(s => s.side === c.side);
       if (!fresh || q.bidDepth === 0 || q.askDepth === 0) continue;
+      const live = await confirmLive(c.market); // and confirm the game is being played right now
+      if (!live.ok) { if (!live.soft) lastErr = `Skipped ${c.market._event || c.market.slug}: ${live.why}`; continue; }
       try {
-        const t = await openTrade({ marketSlug: c.market.slug, question: c.market.question || c.market.title || c.market.slug, side: c.side, expectedPx: fresh.price, usd: stake });
-        placed++; entryFails = 0; A.state.buyingPower = (A.state.buyingPower ?? stake) - stake;
-        toast(t.status === "open" ? `Bought ${c.side} ${label(t)} at ${cents(t.entry)}` : `Order sent for ${label(t)} — confirming…`, "good");
+        const pick = pickName(c.market, c.side);
+        const t = await openTrade({ marketSlug: c.market.slug, question: c.market._event || c.market.question || c.market.title || c.market.slug, side: c.side, expectedPx: fresh.price, usd: stake, eventSlug: c.market._eventSlug, pick, league: c.market._league });
+        placed++; entryFails = 0; busyGames.add(c.market._eventSlug); A.state.buyingPower = (A.state.buyingPower ?? stake) - stake;
+        toast(t.status === "open" ? `Bought ${pick} in ${label(t)} at ${cents(t.entry)}` : `Order sent for ${pick} in ${label(t)} — confirming…`, "good");
       } catch (e) {
-        lastErr = `Skipped ${c.market.slug}: ${e.message}`;
+        lastErr = `Skipped ${c.market._event || c.market.slug}: ${e.message}`;
         if (!e.transient) { entryFails++; if (entryFails >= 3) { entryFails = 0; entryPausedUntil = Date.now() + 60000; } }
       }
       await sleep(300);
     }
-    botNote = placed ? `Opened ${placed} trade${placed > 1 ? "s" : ""}.` : lastErr || `Watching ${scan.rows.length} markets. None passed the live check.`;
+    botNote = placed ? `Opened ${placed} trade${placed > 1 ? "s" : ""}.` : lastErr || `Watching live games. None passed the live check.`;
   }
 
   /* ---------- the loop ---------- */
@@ -257,6 +323,7 @@
     if (A.isUnlocked() && now - A.state.lastRefresh > REFRESH_MS * slow()) await A.refresh().catch(() => {});
     if (((botOn && A.isUnlocked()) || view === "markets") && now - scan.at > SCAN_MS * slow() && !scan.scanning) { await runScan(); render(); }
     if (A.isUnlocked()) {
+      await refreshGames().catch(() => {});
       await exclusive(async () => { await manageTrades(); await enterTrades(); });
       if (!botOn) botNote = trades.some(t => t.status === "open") ? "Bot is off — no new entries. Open trades still follow your exit rules." : "Bot is off.";
     } else botNote = A.state.status === "locked" ? "Unlock your account in Settings to run the bot." : "Connect a Polymarket US account in Settings.";
@@ -312,41 +379,51 @@
     </div>`;
   }
 
+  function leagueCounts() {
+    const per = new Map();
+    for (const m of scan.rows) { if (!per.has(m._league)) per.set(m._league, new Set()); per.get(m._league).add(m._eventSlug); }
+    return [...per.entries()].map(([k, v]) => [k, v.size]).sort((x, y) => y[1] - x[1]);
+  }
+  const leagueChips = () => `<div class="chips"><button class="chip ${prefs.leagues.length ? "" : "on"}" data-act="pick-league" data-league="">All ${new Set(scan.rows.map(m => m._eventSlug)).size}</button>${leagueCounts().map(([k, n]) => `<button class="chip ${prefs.leagues.includes(k) ? "on" : ""}" data-act="pick-league" data-league="${esc(k)}">${esc(k)} ${n}</button>`).join("")}</div>`;
+
   function marketRow(m, pick, held, stake) {
-    const q = S.quotesOf(m), ok = S.validQuotes(q), vol = S.num(m.volume24hr);
-    const prices = ok ? `<span>YES ${cents(q.ask)}</span><span>NO ${cents(1 - q.bid)}</span><span>spread ${cents(q.ask - q.bid)}</span>` : `<span>price loading…</span>`;
-    const buy = A.isUnlocked() && ok && !held ? `<div class="actions">${["YES", "NO"].map(side => `<button class="btn small ${pick?.side === side ? "primary" : ""}" data-act="manual-buy" data-slug="${esc(m.slug)}" data-side="${side}" ${ui.busy ? "disabled" : ""}>Buy ${side} · ${money(stake)}</button>`).join("")}</div>` : "";
-    const title = m._event || m.question || m.title || m.slug, sub = m._event && m.question && m.question !== m._event ? m.question : "";
-    const state = [m._score, m._period, m._clock].filter(Boolean).map(esc).join(" · ");
-    return `<div class="market-card ${held ? "held" : ""}"><b>${esc(title)}</b>
+    const q = S.quotesOf(m), ok = S.validQuotes(q), vol = S.num(m.volume24hr), sd = sidesOf(m);
+    const yesN = sd.named ? sd.yes : "YES", noN = sd.named ? sd.no : "NO";
+    const prices = ok ? `<span>${esc(yesN)} ${cents(q.ask)}</span><span>${esc(noN)} ${cents(1 - q.bid)}</span><span>spread ${cents(q.ask - q.bid)}</span>` : `<span>price loading…</span>`;
+    const buy = A.isUnlocked() && ok && !held ? `<div class="actions">${["YES", "NO"].map(side => `<button class="btn small ${pick?.side === side ? "primary" : ""}" data-act="manual-buy" data-slug="${esc(m.slug)}" data-side="${side}" ${ui.busy ? "disabled" : ""}>Buy ${esc(side === "YES" ? yesN : noN)} · ${money(stake)}</button>`).join("")}</div>` : "";
+    const title = m._event || m.question || m.title || m.slug, sub = !sd.named && m.question && m.question !== m._event ? m.question : "";
+    return `<div class="market-card ${held ? "held" : ""}"><b>${esc(title)}</b><span class="league">${esc(m._league || "")}</span>
       ${sub ? `<small class="q">${esc(sub)}</small>` : ""}
-      <span class="pill live">● LIVE${state ? ` · ${state}` : ""}</span>
-      ${pick ? `<span class="pill good" style="margin:6px 0 2px">Strategy pick: ${pick.side} at ${cents(pick.price)}</span>` : ""}
+      ${liveBadge(gameInfo.get(m._eventSlug))}
+      ${pick ? `<span class="pill good" style="margin:6px 0 2px">Strategy pick: ${esc(pickName(m, pick.side))} at ${cents(pick.price)}</span>` : ""}
       <div class="row">${prices}${vol != null ? `<span>${Math.round(vol).toLocaleString()} traded/24h</span>` : ""}</div>${buy}</div>`;
   }
   function marketsView() {
+    const rows = scan.rows.filter(leagueOk);
     const picks = new Map();
-    for (const c of S.scanForEntries(scan.rows, cfg, new Set(), scan.horizonMs)) if (!picks.has(c.market.slug)) picks.set(c.market.slug, c);
+    for (const c of S.scanForEntries(rows, cfg, new Set(), scan.horizonMs)) if (!picks.has(c.market.slug)) picks.set(c.market.slug, c);
     const held = new Set(trades.filter(openish).map(t => t.marketSlug));
-    const sum = scan.sum, stake = S.stakeFor(cfg, A.state.buyingPower);
-    const status = scan.error && !scan.rows.length ? "Couldn't load live games." : scan.at ? `${scan.games ?? 0} games live now · ${scan.rows.length} tradable lines · ${sum?.withPrices ?? 0} with prices · ${picks.size} the strategy would buy` : "Loading live games…";
+    const sum = scan.sum, stake = S.stakeFor(cfg, A.state.buyingPower), hid = liveCache.hidden || {}, nHid = (hid.future || 0) + (hid.farEnd || 0);
+    const status = scan.error && !scan.rows.length ? "Couldn't load live games." : scan.at ? `${new Set(rows.map(m => m._eventSlug)).size} games live now · ${rows.length} tradable lines · ${picks.size} the strategy would buy` : "Loading live games…";
     const head = `<div class="panel"><div class="block-head"><p class="hint" style="margin:0">${esc(status)}</p><button class="btn small" data-act="rescan" ${scan.scanning ? "disabled" : ""}>${scan.scanning ? "Loading…" : "Refresh"}</button></div>
       ${scan.error ? `<p class="note bad">${esc(scan.error)} <a href="#settings">Open Settings → Test connection</a> to see which step fails.</p>` : ""}
-      <p class="hint" style="margin-bottom:0">Only games being played right now, busiest first. One line per game — the bot trades the main moneyline.</p>
-      ${sum && scan.rows.length && !picks.size ? `<p class="hint">Nothing worth buying right now${sum.text ? ` — skipped: ${esc(sum.text)}` : ""}. You can still buy any live game below by hand.</p>` : ""}</div>`;
-    if (!scan.rows.length) return `${head}${scan.at && !scan.error ? `<p class="hint" style="margin-top:12px">No games are being played right now.</p>` : ""}`;
-    return `${head}<div class="market-grid" style="margin-top:12px">${scan.rows.slice(0, 120).map(m => marketRow(m, picks.get(m.slug), held.has(m.slug), stake)).join("")}</div>`;
+      ${scan.rows.length ? leagueChips() : ""}
+      <p class="hint" style="margin-bottom:0">Only games being played right now, busiest first — one line per game. Scores and clocks refresh about every 30 seconds. The bot re-checks a game is live before every buy.${nHid ? ` ${nHid} line${nHid > 1 ? "s" : ""} hidden because they aren't today's live games.` : ""}</p>
+      ${sum && rows.length && !picks.size ? `<p class="hint">Nothing worth buying right now${sum.text ? ` — skipped: ${esc(sum.text)}` : ""}. You can still buy any live game below by hand.</p>` : ""}</div>`;
+    if (!rows.length) return `${head}${scan.at && !scan.error ? `<p class="hint" style="margin-top:12px">${prefs.leagues.length ? "No live games in your selected sports right now." : "No games are being played right now."}</p>` : ""}`;
+    return `${head}<div class="market-grid" style="margin-top:12px">${rows.slice(0, 120).map(m => marketRow(m, picks.get(m.slug), held.has(m.slug), stake)).join("")}</div>`;
   }
 
   function tradeRow(t) {
-    const live = t.status === "open";
+    const live = t.status === "open", who = t.pick && t.pick !== t.side ? t.pick : t.side;
     const unreal = live && t.mark != null && t.quantity ? S.netPnl(t.entry, t.mark, t.quantity) : null;
     const nums = live
-      ? `<span>${t.side}</span><span>in ${cents(t.entry)}</span><span>now ${cents(t.mark)}</span><span class="${(unreal ?? 0) >= 0 ? "gain" : "loss"}">${smoney(unreal)}</span><span>${ago(t.openedAt)}</span>`
+      ? `<span>${esc(who)}</span><span>in ${cents(t.entry)}</span><span>now ${cents(t.mark)}</span><span class="${(unreal ?? 0) >= 0 ? "gain" : "loss"}">${smoney(unreal)}</span><span>${ago(t.openedAt)}</span>`
       : t.status === "pending"
-        ? `<span>${t.side}</span><span>confirming with Polymarket…</span>`
-        : `<span>${t.side}</span><span>in ${cents(t.entry)}</span><span>out ${cents(t.exit)}${t.est ? " (est.)" : ""}</span><span class="${(t.pnl ?? 0) >= 0 ? "gain" : "loss"}">${smoney(t.pnl)}</span><span>${esc(reasonText(t.reason))}</span>`;
-    return `<div class="trade-row"><b>${esc(t.question || t.marketSlug)}</b><div class="row">${nums}</div>
+        ? `<span>${esc(who)}</span><span>confirming with Polymarket…</span>`
+        : `<span>${esc(who)}</span><span>in ${cents(t.entry)}</span><span>out ${cents(t.exit)}${t.est ? " (est.)" : ""}</span><span class="${(t.pnl ?? 0) >= 0 ? "gain" : "loss"}">${smoney(t.pnl)}</span><span>${esc(reasonText(t.reason))}</span>`;
+    const game = live || t.status === "pending" ? liveBadge(gameInfo.get(t.eventSlug)) : "";
+    return `<div class="trade-row"><b>${esc(t.question || t.marketSlug)}</b>${t.league ? `<span class="league">${esc(t.league)}</span>` : ""}${game}<div class="row">${nums}</div>
       ${live ? `<div class="actions"><button class="btn small danger" data-act="close-trade" data-id="${esc(t.id)}" ${ui.busy ? "disabled" : ""}>Close now</button></div>` : ""}</div>`;
   }
   function tradesView() {
@@ -436,6 +513,12 @@
         <div class="block-head"><h2>Risk settings</h2><button class="btn small ghost" data-act="reset-cfg">Reset</button></div>
         <div class="form-grid">${FIELDS.map(cfgField).join("")}</div>
         <p class="hint">Changes save when you tap out of a field. The strategy chooses which markets, what price range and when to sell.</p>
+      </div>
+      <div class="panel" style="margin-top:12px">
+        <div class="block-head"><h2>Your trading style</h2></div>
+        <p class="hint" style="margin-top:0">Sports: <b>${prefs.leagues.length ? esc(prefs.leagues.join(", ")) : "all live sports"}</b>. Pick them with the chips at the top of the Markets tab — the bot only enters games in those sports.</p>
+        <label class="toggle-row"><input type="checkbox" data-act="toggle-breaks" ${prefs.skipBreaks ? "checked" : ""}> Don't enter during halftime or other breaks</label>
+        <p class="hint">Always on: the bot only buys a game Polymarket confirms is live at the moment of the buy, and holds one trade per game at a time.</p>
       </div>`;
   }
 
@@ -474,6 +557,7 @@
     }
     const txt = !A.isUnlocked() || s.health.ok === false ? "" : s.lastOk ? `Live · balance updated ${ago(s.lastOk)} ago` : "Connecting…";
     document.querySelectorAll('[data-live="ago"]').forEach(el => { if (el.textContent !== txt) el.textContent = txt; });
+    document.querySelectorAll(".age[data-ts]").forEach(el => { const t = ` updated ${ago(Number(el.dataset.ts))} ago`; if (el.textContent !== t) el.textContent = t; });
   }
 
   function route() {
@@ -490,7 +574,11 @@
     const out = [];
     try { const r = await PUB.markets({ limit: 1, active: true }); const m0 = (r?.markets || [])[0]; const qq = m0 && S.quotesOf(m0); out.push({ ok: true, label: "Market data (gateway.polymarket.us)", detail: m0 ? `Reachable. Sample market has ${Object.keys(m0).length} fields (${Object.keys(m0).slice(0, 12).join(", ")}…); live prices ${S.validQuotes(qq) ? "included" : "not in the list, fetched per market"}.` : "Reachable, but returned no markets." }); }
     catch (e) { out.push({ ok: false, label: "Market data (gateway.polymarket.us)", detail: e.message }); }
-    try { const r = await fetchLive(); const kinds = [...new Set(r.rows.map(m => S.typeOf(m) || "untyped"))].slice(0, 6).join(", "); out.push({ ok: true, label: "Live games (events, live=true)", detail: `${r.games} games live now → ${r.rows.length} main lines kept. Market types: ${kinds || "none"}.` }); }
+    try {
+      const r = await fetchLive(), kinds = [...new Set(r.rows.map(m => S.typeOf(m) || "untyped"))].slice(0, 6).join(", ");
+      out.push({ ok: true, label: "Live games (events, live=true)", detail: `${r.games} games live now → ${r.rows.length} main lines kept. Market types: ${kinds || "none"}.${r.hidden.future || r.hidden.farEnd ? ` Hidden: ${r.hidden.future} not started, ${r.hidden.farEnd} dated beyond today.` : ""}` });
+      if (r.sample) out.push({ ok: true, label: "Sample live game (raw)", detail: JSON.stringify(r.sample).slice(0, 500) });
+    }
     catch (e) { out.push({ ok: false, label: "Live games (events, live=true)", detail: e.message }); }
     if (A.isUnlocked()) {
       const sdk = A.client();
@@ -541,6 +629,8 @@
         } catch (e2) { toast(e2.message, "bad"); }
       }
     }),
+    "pick-league": el => { const k = el.dataset.league; prefs.leagues = !k ? [] : prefs.leagues.includes(k) ? prefs.leagues.filter(x => x !== k) : [...prefs.leagues, k]; savePrefs(); render(true); },
+    "toggle-breaks": () => { prefs.skipBreaks = !prefs.skipBreaks; savePrefs(); render(true); },
     "toggle-allow-reset": () => { ui.allowReset = !ui.allowReset; render(true); },
     "back-locked": () => { ui.connectNew = false; ui.formError = ""; render(true); },
     "toggle-reveal": el => { const k = el.dataset.key; ui.reveal[k] = !ui.reveal[k]; render(true); document.getElementById(el.dataset.target)?.focus(); },
@@ -563,14 +653,17 @@
     "manual-buy": el => guard("buy", () => exclusive(async () => {
       const slug = el.dataset.slug, side = el.dataset.side;
       const row = scan.rows.find(m => m.slug === slug); if (!row) return;
+      const live = await confirmLive(row, { manual: true });
+      if (!live.ok) { toast(live.why, "bad"); return; }
       const q = await quotesFor(slug), px = q ? S.entryPrice(q, side) : null;
       if (px == null) { toast("Couldn't get a live price for that market.", "bad"); return; }
       const stake = S.stakeFor(cfg, A.state.buyingPower);
       if ((A.state.buyingPower ?? 0) < stake) { toast(`Buying power ${money(A.state.buyingPower)} is below the ${money(stake)} stake.`, "bad"); return; }
       const minQty = S.num(row.minimumTradeQty);
       if (minQty && stake / px < minQty) { toast(`This market needs at least ${minQty} contracts; ${money(stake)} buys about ${(stake / px).toFixed(1)}. Raise your stake.`, "bad"); return; }
-      if (!confirm(`Buy ${side} for ${money(stake)}?\n\n${row.question || row.title || slug}\n\nAbout ${cents(px)} per contract, as a market order. The bot will manage the exit.`)) return;
-      try { const t = await openTrade({ marketSlug: slug, question: row.question || row.title || slug, side, expectedPx: px, usd: stake, manual: true }); toast(t.status === "open" ? `Bought ${side} at ${cents(t.entry)}` : "Order sent — confirming…", "good"); }
+      const pick = pickName(row, side), g = live.g, gs = [periodText(g.period), g.clock, g.score && `Score ${g.score}`].filter(Boolean).join(" · ");
+      if (!confirm(`Buy ${pick} for ${money(stake)}?\n\n${row._event || row.question || slug}\nLIVE${gs ? ` · ${gs}` : ""}\n\nAbout ${cents(px)} per contract, as a market order. The bot will manage the exit.`)) return;
+      try { const t = await openTrade({ marketSlug: slug, question: row._event || row.question || row.title || slug, side, expectedPx: px, usd: stake, manual: true, eventSlug: row._eventSlug, pick, league: row._league }); toast(t.status === "open" ? `Bought ${pick} at ${cents(t.entry)}` : "Order sent — confirming…", "good"); }
       catch (e) { toast(e.message, "bad"); }
     })),
     panic: () => guard("panic", async () => {
@@ -625,6 +718,6 @@
   });
 
   A.on(() => { render(); updateChrome(); });
-  if (store.get("blueedgeus.debug", false)) window.__blueedge = { tick, get trades() { return trades; }, get cfg() { return cfg; }, get scan() { return scan; }, get botOn() { return botOn; }, set botOn(v) { botOn = v; }, drafts, exclusive, runScan, actions };
+  if (store.get("blueedgeus.debug", false)) window.__blueedge = { tick, get trades() { return trades; }, get cfg() { return cfg; }, get scan() { return scan; }, get botOn() { return botOn; }, set botOn(v) { botOn = v; }, drafts, exclusive, runScan, actions, fetchLive, confirmLive, gameInfo, prefs, VIEWS, render, enterTrades, liveCache };
   route(); loop();
 })();

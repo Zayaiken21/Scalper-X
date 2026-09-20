@@ -87,7 +87,7 @@ window.BlueEdgeStrategy = (() => {
   }
 
   const REASONS = {
-    inactive: "not open for trading", multiSided: "more than two outcomes", farFuture: "closes too far out",
+    inactive: "not open for trading", notToday: "not today's game", multiSided: "more than two outcomes", farFuture: "closes too far out",
     lowVolume: "too little trading", noQuotes: "no live price yet", wideSpread: "spread too wide",
     pricing: "odds or fees not worth it", minSize: "stake below the market's minimum size",
   };
@@ -101,6 +101,7 @@ window.BlueEdgeStrategy = (() => {
       if (m.marketSides.length > 2) return { reason: "multiSided" };
       if (m.marketSides.some(s => s.tradable === false)) return { reason: "inactive" };
     }
+    if (m._live && m.endDate) { const t = Date.parse(m.endDate); if (Number.isFinite(t) && t - Date.now() > 36 * 3600000) return { reason: "notToday" }; } // a live line dated beyond today is a future, not this game
     if (m.endDate && !m._live) { const t = Date.parse(m.endDate); if (Number.isFinite(t) && t - Date.now() > horizonMs) return { reason: "farFuture" }; } // a past endDate is fine: live games can carry their scheduled time
     const pl = plan(cfg), vol = num(m.volume24hr);
     if (vol != null && vol < pl.minVolume) return { reason: "lowVolume" };
