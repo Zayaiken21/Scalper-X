@@ -799,3 +799,11 @@ details#rawBal pre { margin: 8px 0 0; padding: 12px; max-height: 260px; overflow
 .market-card .actions { margin-top: 10px; }
 .market-card .actions .btn { flex: 1 1 0; }
 .block-head .btn.small { flex: none; }
+
+/* v1.3: in-play badge, in-field Show/Clear buttons, forgot-passcode section */
+.pill.live { margin: 0 0 4px; background: var(--down-soft); color: var(--down); }
+.fld .reveal-wrap input { width: 100%; padding-right: 124px; }
+.reveal-wrap .eye { min-width: 52px; }
+.reveal-wrap .eye.clear { right: 64px; color: var(--muted); }
+details.forgot { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+details.forgot summary { cursor: pointer; font-size: 14px; font-weight: 700; color: var(--accent); min-height: 40px; display: flex; align-items: center; }

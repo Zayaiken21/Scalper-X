@@ -95,6 +95,18 @@ window.BlueEdgeAccount = (() => {
     writeStore({ active: null, list: [] });
     lock(); state.status = "none"; state.account = null; emit();
   }
+  // Forgot-passcode reset. The passcode is the encryption key for the saved API secret, so it can't be recovered or
+  // bypassed. Typing the account's name only removes that one encrypted copy from this device; getting back in still
+  // needs the Key ID + secret key, which the person re-enters and re-encrypts under a new passcode.
+  const normName = s => String(s || "").trim().replace(/\s+/g, " ").toLowerCase();
+  function resetByName(name) {
+    const want = normName(name);
+    if (!want) throw new Error("Type the account name to reset it.");
+    const s = readStore(), rec = s.list.find(r => normName(r.label) === want);
+    if (!rec) throw new Error("That name doesn't match the saved account.");
+    s.list = s.list.filter(r => r.id !== rec.id); s.active = s.list[0]?.id || null; writeStore(s);
+    const meta = metaOf(rec); lock(); return meta;
+  }
   const isUnlocked = () => state.status === "unlocked" && !!sdk;
   const client = () => sdk;
 
@@ -149,7 +161,7 @@ window.BlueEdgeAccount = (() => {
       pendingCredit: n("pendingCredit"), openOrders, unsettled, margin: n("marginRequirement"), reservation,
       pendingWithdrawals: wdTotal, extras, bonus: pick(/bonus|promo|reward/i), withdrawableReported: pick(/withdraw/i),
       withdrawableEst: Math.max(0, Number((cash - openOrders - unsettled - wdTotal - reservation).toFixed(2))),
-      lastUpdated: row?.lastUpdated || null, raw: row,
+      lastUpdated: row?.lastUpdated || null,
     };
   }
 
@@ -199,5 +211,5 @@ window.BlueEdgeAccount = (() => {
   state.status = hasVault() ? "locked" : "none";
   state.account = savedMeta();
 
-  return { state, on, savedMeta, hasVault, save, unlock, lock, remove, refresh, buyMarket, closeNow, cancelAllOpen, isUnlocked, client, parseOrderResult, normalisePositions, parseBalance };
+  return { state, on, savedMeta, hasVault, save, unlock, lock, remove, resetByName, refresh, buyMarket, closeNow, cancelAllOpen, isUnlocked, client, parseOrderResult, normalisePositions, parseBalance };
 })();

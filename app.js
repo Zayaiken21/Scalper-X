@@ -18,10 +18,10 @@
   let trades = (store.get(TRADES_KEY, []) || []).filter(t => t && t.marketSlug && t.status !== "failed");
   let botOn = false;                       // the bot always starts OFF after a reload — real money should never resume unattended
   let view = "home", botNote = "Bot is off.";
-  const scan = { rows: [], at: 0, error: "", scanning: false, horizonMs: S.HORIZONS[0], sum: null };
+  const scan = { rows: [], at: 0, error: "", liveError: "", scanning: false, horizonMs: S.HORIZONS[0], sum: null };
   const bboCache = new Map();              // slug -> { q, at }: per-market price lookups, reused for 15s
   const drafts = {};                       // what the user has typed but not saved yet — survives any redraw
-  const ui = { busy: null, formError: "", diag: null, diagRunning: false, rawOpen: false };
+  const ui = { busy: null, formError: "", diag: null, diagRunning: false, forgotOpen: false, connectNew: false, reveal: {} };
   let entryFails = 0, entryPausedUntil = 0;
   const REFRESH_MS = 10000, SCAN_MS = 8000, TICK_MS = 2000, COOLDOWN_MS = 10 * 60000;
   // After any 429 the app halves its own polling for a minute, so it can never keep pushing against a limit.
@@ -63,6 +63,26 @@
     if (!rows.length) rows = (await pull(base))?.markets || []; // filters can be picky: an unfiltered list beats an empty one
     return rows.filter(m => String(m.category || "").toLowerCase() !== "crypto").sort(byVolume);
   }
+  // In-play games: the events endpoint knows which games are live right now (with score and period); their markets are
+  // nested inside. One request, and a failure here never breaks the rest of the scan.
+  const scoreText = s => s == null ? "" : typeof s === "object" ? Object.values(s).filter(v => v != null && typeof v !== "object").join("–") : String(s);
+  async function fetchLive() {
+    const pull = async params => (await PUB.events({ limit: 100, ...params }))?.events || [];
+    let evs;
+    try { evs = await pull({ live: true, active: true, closed: false }); }
+    catch (e) { if (!(e.status >= 400 && e.status < 500) || e.status === 429) throw e; evs = await pull({ live: true }); }
+    const out = [];
+    for (const ev of evs) {
+      if (ev.live !== true || ev.ended === true || String(ev.category || "").toLowerCase() === "crypto") continue; // trust the flag, not the filter
+      for (const m of ev.markets || []) if (m?.slug) out.push({ ...m, _live: true, _score: scoreText(ev.score), _period: ev.period ? String(ev.period) : "", _event: ev.title || "" });
+    }
+    return out.sort(byVolume);
+  }
+  // In-play markets first (busiest first), then everything else by volume; a market in both lists appears once, marked live.
+  function withLive(live, rows) {
+    const liveSlugs = new Set(live.map(m => m.slug));
+    return live.concat(rows.filter(m => !liveSlugs.has(m.slug)).sort(byVolume));
+  }
   // The list endpoint doesn't always carry live prices. For the busiest markets missing them, ask for the best bid/offer
   // directly — capped per pass and cached, so this stays a handful of requests, never a flood.
   async function fillQuotes(rows) {
@@ -83,11 +103,12 @@
   async function runScan() {
     scan.scanning = true;
     try {
-      let rows = await fetchMarkets(S.HORIZONS[1]); await fillQuotes(rows);
+      const live = await fetchLive().then(r => { scan.liveError = ""; return r; }).catch(e => { scan.liveError = e.message; return []; });
+      let rows = withLive(live, await fetchMarkets(S.HORIZONS[1])); await fillQuotes(rows);
       let used = pickHorizon(rows, S.HORIZONS.slice(0, 2));
       if (used === undefined) {
         const wide = await fetchMarkets(Infinity), seen = new Set(rows.map(m => m.slug));
-        rows = rows.concat(wide.filter(m => !seen.has(m.slug))).sort(byVolume); await fillQuotes(rows);
+        rows = withLive(live, rows.concat(wide.filter(m => !seen.has(m.slug)))); await fillQuotes(rows);
         used = pickHorizon(rows, S.HORIZONS.slice(1)) ?? Infinity;
       }
       scan.rows = rows; scan.horizonMs = used; scan.at = Date.now(); scan.error = ""; scan.sum = S.summarize(rows, cfg, used);
@@ -260,7 +281,7 @@
   function homeView() {
     const open = trades.filter(t => t.status === "open");
     const unreal = open.reduce((s, t) => s + (t.mark != null && t.quantity ? S.netPnl(t.entry, t.mark, t.quantity) : 0), 0);
-    const pnl = todayPnl();
+    const pnl = todayPnl(), bs = balSummary();
     const cta = A.isUnlocked() ? "" : `<div class="panel" style="margin-bottom:12px"><p class="hint" style="margin:0 0 4px">${A.state.status === "locked" ? "Your account is saved but locked." : "No account connected yet."}</p><a class="btn primary" href="#settings">${A.state.status === "locked" ? "Unlock account" : "Connect account"}</a></div>`;
     return `${cta}
       <div class="panel">
@@ -270,10 +291,9 @@
         <p class="hint" style="margin-top:0">${esc(botNote)}</p>
         <p class="hint auto">${autoLine()}</p>
         <div class="stat-grid">
-          <div><span>Cash balance</span><b>${money(A.state.balance)}</b></div>
-          <div><span>Buying power</span><b>${money(A.state.buyingPower)}</b></div>
-          ${A.state.bal ? `<div><span>${A.state.bal.withdrawableReported ? "Withdrawable" : "Withdrawable (est.)"}</span><b>${money(A.state.bal.withdrawableReported ? A.state.bal.withdrawableReported.value : A.state.bal.withdrawableEst)}</b></div>` : ""}
-          ${A.state.bal?.bonus ? `<div><span>Bonus balance</span><b>${money(A.state.bal.bonus.value)}</b></div>` : ""}
+          <div><span>Cash balance</span><b>${money(bs.cash)}</b></div>
+          <div><span>Bonus balance</span><b>${money(bs.bonus)}</b></div>
+          <div><span>Withdrawable balance</span><b>${money(bs.withdrawable)}</b></div>
           <div><span>Open trades</span><b>${open.length} / ${cfg.maxOpen}</b></div>
           <div><span>Today, closed</span><b class="${pnl >= 0 ? "gain" : "loss"}">${smoney(pnl)}</b></div>
         </div>
@@ -284,27 +304,20 @@
       </div>`;
   }
 
+  // Only three balances are shown: cash, bonus and withdrawable.
+  function balSummary() {
+    const b = A.state.bal;
+    if (!b) return { cash: A.state.balance, bonus: null, withdrawable: null };
+    return { cash: b.cash, bonus: b.bonus ? b.bonus.value : 0, withdrawable: b.withdrawableReported ? b.withdrawableReported.value : b.withdrawableEst };
+  }
   function balanceDetails() {
-    const b = A.state.bal; if (!b) return "";
-    const row = (k, v, hint) => v == null ? "" : `<div class="balrow"><span>${esc(k)}${hint ? `<small>${esc(hint)}</small>` : ""}</span><b>${money(v)}</b></div>`;
-    const extras = Object.entries(b.extras).map(([k, v]) => `<div class="balrow"><span>${esc(k)}<small>Extra field reported by Polymarket</small></span><b>${esc(String(v))}</b></div>`).join("");
+    const s = balSummary(); if (!A.state.bal) return "";
+    const row = (k, v, hint) => `<div class="balrow"><span>${esc(k)}<small>${esc(hint)}</small></span><b>${money(v)}</b></div>`;
     return `<div class="bal-table">
-      ${b.bonus ? row("Bonus balance", b.bonus.value, `Reported by Polymarket as “${b.bonus.key}”`) : ""}
-      ${row("Cash balance", b.cash, "Money in your account, not counting positions")}
-      ${row("Buying power", b.buyingPower, "What you can spend on new trades")}
-      ${b.withdrawableReported ? row("Withdrawable", b.withdrawableReported.value, `Reported by Polymarket as “${b.withdrawableReported.key}”`) : row("Withdrawable (estimate)", b.withdrawableEst, "Cash not tied up in orders, unsettled funds or pending withdrawals")}
-      ${row("Positions value", b.assetNotional, "Current value of your open positions")}
-      ${row("Available collateral", b.assetAvailable)}
-      ${row("Pending credits", b.pendingCredit)}
-      ${row("In open orders", b.openOrders)}
-      ${row("Unsettled funds", b.unsettled, "Not yet available to trade")}
-      ${row("Pending withdrawals", b.pendingWithdrawals)}
-      ${row("Margin requirement", b.margin)}
-      ${row("Reserved", b.reservation)}
-      ${extras}
-    </div>
-    ${!b.bonus || !b.withdrawableReported ? `<p class="hint">Polymarket US's balance data has no separate bonus or withdrawable field, so ${!b.bonus ? "a bonus balance can't be shown separately" : ""}${!b.bonus && !b.withdrawableReported ? " and " : ""}${!b.withdrawableReported ? "withdrawable is an estimate that may include bonus funds" : ""}. Check the Withdraw screen in Polymarket before moving money.</p>` : ""}
-    <details ${ui.rawOpen ? "open" : ""} id="rawBal"><summary>Raw balance data from Polymarket</summary><pre>${esc(JSON.stringify(b.raw, null, 2))}</pre></details>`;
+      ${row("Cash balance", s.cash, "Money in your account, not counting positions")}
+      ${row("Bonus balance", s.bonus, "Shows $0.00 unless Polymarket reports a bonus on your account")}
+      ${row("Withdrawable balance", s.withdrawable, "Cash not tied up in orders, unsettled funds or pending withdrawals")}
+    </div>`;
   }
 
   function marketRow(m, pick, held, stake) {
@@ -312,6 +325,7 @@
     const prices = ok ? `<span>YES ${cents(q.ask)}</span><span>NO ${cents(1 - q.bid)}</span><span>spread ${cents(q.ask - q.bid)}</span>` : `<span>price loading…</span>`;
     const buy = A.isUnlocked() && ok && !held ? `<div class="actions">${["YES", "NO"].map(side => `<button class="btn small ${pick?.side === side ? "primary" : ""}" data-act="manual-buy" data-slug="${esc(m.slug)}" data-side="${side}" ${ui.busy ? "disabled" : ""}>Buy ${side} · ${money(stake)}</button>`).join("")}</div>` : "";
     return `<div class="market-card ${held ? "held" : ""}"><b>${esc(m.question || m.title || m.slug)}</b>
+      ${m._live ? `<span class="pill live">● LIVE${m._score ? ` · ${esc(m._score)}` : ""}${m._period ? ` · ${esc(m._period)}` : ""}</span>` : ""}
       ${pick ? `<span class="pill good" style="margin:6px 0 2px">Strategy pick: ${pick.side} at ${cents(pick.price)}</span>` : ""}
       <div class="row">${prices}${vol != null ? `<span>${Math.round(vol).toLocaleString()} traded/24h</span>` : ""}</div>${buy}</div>`;
   }
@@ -320,13 +334,16 @@
     for (const c of S.scanForEntries(scan.rows, cfg, new Set(), scan.horizonMs)) if (!picks.has(c.market.slug)) picks.set(c.market.slug, c);
     const held = new Set(trades.filter(openish).map(t => t.marketSlug));
     const sum = scan.sum, stake = S.stakeFor(cfg, A.state.buyingPower);
-    const sorted = [...scan.rows].sort((a, b) => (picks.has(b.slug) - picks.has(a.slug)));
-    const status = scan.error && !scan.rows.length ? "Couldn't load markets." : scan.at ? `${scan.rows.length} live markets · ${sum?.withPrices ?? 0} with prices · ${picks.size} the strategy would buy` : "Loading live markets…";
+    const byPick = (a, b) => (picks.has(b.slug) - picks.has(a.slug));
+    const liveRows = scan.rows.filter(m => m._live).sort(byPick), soon = scan.rows.filter(m => !m._live).sort(byPick);
+    const status = scan.error && !scan.rows.length ? "Couldn't load markets." : scan.at ? `${liveRows.length} live now · ${scan.rows.length} markets · ${sum?.withPrices ?? 0} with prices · ${picks.size} the strategy would buy` : "Loading live markets…";
     const head = `<div class="panel"><div class="block-head"><p class="hint" style="margin:0">${esc(status)}</p><button class="btn small" data-act="rescan" ${scan.scanning ? "disabled" : ""}>${scan.scanning ? "Loading…" : "Refresh"}</button></div>
       ${scan.error ? `<p class="note bad">${esc(scan.error)} <a href="#settings">Open Settings → Test connection</a> to see which step fails.</p>` : ""}
+      ${scan.liveError ? `<p class="note bad">Couldn't load in-play games: ${esc(scan.liveError)}</p>` : ""}
       ${sum && scan.rows.length && !picks.size ? `<p class="hint">Nothing worth buying right now${sum.text ? ` — skipped: ${esc(sum.text)}` : ""}. You can still buy any market below by hand.</p>` : ""}</div>`;
     if (!scan.rows.length) return head;
-    return `${head}<div class="market-grid" style="margin-top:12px">${sorted.slice(0, 40).map(m => marketRow(m, picks.get(m.slug), held.has(m.slug), stake)).join("")}</div>`;
+    const section = (title, list, empty) => `<div class="block" style="margin-top:14px"><div class="block-head"><h2>${title} (${list.length})</h2></div>${list.length ? `<div class="market-grid">${list.map(m => marketRow(m, picks.get(m.slug), held.has(m.slug), stake)).join("")}</div>` : `<p class="hint">${empty}</p>`}</div>`;
+    return `${head}${section("Live now", liveRows.slice(0, 40), scan.at && !scan.liveError ? "No games are in play right now." : "Live games will show here.")}${section("Coming up", soon.slice(0, 25), "Nothing else scheduled soon.")}`;
   }
 
   function tradeRow(t) {
@@ -366,6 +383,14 @@
   };
   const textIn = (id, type, ph, draftKey, extra = "") => `<input id="${id}" type="${type}" placeholder="${esc(ph)}" value="${esc(drafts[draftKey] ?? "")}" data-draft="${draftKey}" autocomplete="${type === "password" ? "new-password" : "off"}" autocapitalize="off" autocorrect="off" spellcheck="false" ${extra}>`;
 
+  // Passcode/secret fields: Show and Clear buttons sit inside the field, so whatever is typed can always be wiped or checked.
+  const secretIn = (id, ph, draftKey, extra = "") => {
+    const shown = !!ui.reveal[draftKey];
+    return `<div class="reveal-wrap"><input id="${id}" type="${shown ? "text" : "password"}" placeholder="${esc(ph)}" value="${esc(drafts[draftKey] ?? "")}" data-draft="${draftKey}" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" ${extra}>
+      <button type="button" class="eye clear" data-act="clear-field" data-target="${id}" data-key="${draftKey}" aria-label="Clear">Clear</button>
+      <button type="button" class="eye" data-act="toggle-reveal" data-target="${id}" data-key="${draftKey}" aria-label="${shown ? "Hide" : "Show"}">${shown ? "Hide" : "Show"}</button></div>`;
+  };
+
   function diagBlock() {
     if (!ui.diag) return "";
     return `<ul class="diag">${ui.diag.map(d => `<li class="${d.ok ? "ok" : "bad"}"><b>${d.ok ? "✓" : "✕"} ${esc(d.label)}</b><span>${esc(d.detail)}</span></li>`).join("")}</ul>`;
@@ -384,13 +409,17 @@
         ${diagBlock()}
       </div>`;
     }
-    if (A.state.status === "locked") {
+    if (A.state.status === "locked" && !ui.connectNew) {
       return `<div class="panel settings-view">
         <div class="block-head"><h2>${esc(acc?.label || "Saved account")}</h2><span class="pill warn">Locked</span></div>
-        <label class="fld"><span>Passcode</span>${textIn("passIn", "password", "Enter your passcode", "unlockPass", 'data-enter="unlock" enterkeyhint="go"')}</label>
+        <label class="fld"><span>Passcode</span>${secretIn("passIn", "Enter your passcode", "unlockPass", 'data-enter="unlock" enterkeyhint="go"')}</label>
         ${ui.formError ? `<p class="note bad">${esc(ui.formError)}</p>` : ""}
         <div class="actions"><button class="btn primary" data-act="unlock" ${busy ? "disabled" : ""}>${busy === "unlock" ? "Unlocking…" : "Unlock"}</button><button class="btn small danger" data-act="remove">Remove account</button></div>
-        <p class="hint">Forgot the passcode? Remove the account and connect again with your Key ID and secret.</p>
+        <details class="forgot" id="forgot" ${ui.forgotOpen ? "open" : ""}><summary>Forgot your passcode?</summary>
+          <p class="hint">Type the account name shown above, then tap Reset. That clears the saved copy on this device so you can reconnect with your Key ID and secret key and choose a new passcode. (The passcode is what locks your key, so it can't be looked up — your secret key is needed to set it up again.)</p>
+          <label class="fld"><span>Account name</span>${textIn("resetIn", "text", "Type the account name", "resetName", 'data-enter="reset-pass" enterkeyhint="go"')}</label>
+          <div class="actions"><button class="btn small danger" data-act="reset-pass">Reset passcode</button></div>
+        </details>
         ${diagBlock()}
       </div>`;
     }
@@ -399,10 +428,10 @@
       <p class="hint" style="margin-top:0">Create an API key at polymarket.us/developer. It's encrypted on this device with a passcode you choose and only ever used to sign your own requests.</p>
       <label class="fld"><span>Label (optional)</span>${textIn("labelIn", "text", "e.g. Main account", "label")}</label>
       <label class="fld"><span>Key ID</span>${textIn("keyIdIn", "text", "Paste your Key ID", "keyId")}</label>
-      <label class="fld"><span>Secret key</span>${textIn("secretIn", "password", "Paste your secret key", "secret")}</label>
-      <label class="fld"><span>Choose a passcode</span>${textIn("passIn", "password", "4+ characters — you enter this each session", "passcode", 'data-enter="connect" enterkeyhint="go"')}</label>
+      <label class="fld"><span>Secret key</span>${secretIn("secretIn", "Paste your secret key", "secret")}</label>
+      <label class="fld"><span>Choose a passcode</span>${secretIn("passIn", "4+ characters — you enter this each session", "passcode", 'data-enter="connect" enterkeyhint="go"')}</label>
       ${ui.formError ? `<p class="note bad">${esc(ui.formError)}</p>` : ""}
-      <div class="actions"><button class="btn primary" data-act="connect" ${busy ? "disabled" : ""}>${busy === "connect" ? "Connecting…" : "Connect"}</button><button class="btn small" data-act="diag" ${ui.diagRunning ? "disabled" : ""}>${ui.diagRunning ? "Testing…" : "Test connection"}</button></div>
+      <div class="actions"><button class="btn primary" data-act="connect" ${busy ? "disabled" : ""}>${busy === "connect" ? "Connecting…" : "Connect"}</button>${ui.connectNew && A.hasVault() ? `<button class="btn small ghost" data-act="back-locked">Back</button>` : ""}<button class="btn small" data-act="diag" ${ui.diagRunning ? "disabled" : ""}>${ui.diagRunning ? "Testing…" : "Test connection"}</button></div>
       ${diagBlock()}
     </div>`;
   }
@@ -468,7 +497,7 @@
     catch (e) { out.push({ ok: false, label: "Market data (gateway.polymarket.us)", detail: e.message }); }
     if (A.isUnlocked()) {
       const sdk = A.client();
-      try { const r = await sdk.balances(); const row = (r?.balances || [])[0]; out.push({ ok: true, label: "Signed request (api.polymarket.us)", detail: row ? `Cash ${money(S.num(row.currentBalance))}, buying power ${money(S.num(row.buyingPower))}.` : "Signed OK, but no balance rows were returned." }); }
+      try { const r = await sdk.balances(); const row = (r?.balances || [])[0]; out.push({ ok: true, label: "Signed request (api.polymarket.us)", detail: row ? `Cash ${money(S.num(row.currentBalance))}.` : "Signed OK, but no balance rows were returned." }); }
       catch (e) { out.push({ ok: false, label: "Signed request (api.polymarket.us)", detail: e.message }); }
       try { const r = await sdk.positions(); out.push({ ok: true, label: "Positions", detail: `${A.normalisePositions(r?.positions).length} open position(s) on your account.` }); }
       catch (e) { out.push({ ok: false, label: "Positions", detail: e.message }); }
@@ -488,7 +517,7 @@
     },
     connect: () => guard("connect", async () => {
       ui.formError = "";
-      try { await A.save({ label: drafts.label, keyId: drafts.keyId, secretKey: drafts.secret, passcode: drafts.passcode }); for (const k of ["label", "keyId", "secret", "passcode"]) delete drafts[k]; botNote = "Bot is off."; toast("Connected.", "good"); location.hash = "#home"; }
+      try { await A.save({ label: drafts.label, keyId: drafts.keyId, secretKey: drafts.secret, passcode: drafts.passcode }); ui.connectNew = false; ui.reveal = {}; for (const k of ["label", "keyId", "secret", "passcode"]) delete drafts[k]; botNote = "Bot is off."; toast("Connected.", "good"); location.hash = "#home"; }
       catch (e) { ui.formError = e.message; toast(e.message, "bad"); }
     }),
     unlock: () => guard("unlock", async () => {
@@ -496,8 +525,21 @@
       try { await A.unlock(null, drafts.unlockPass); delete drafts.unlockPass; botNote = "Bot is off."; toast("Unlocked.", "good"); }
       catch (e) { ui.formError = e.message; toast(e.message, "bad"); }
     }),
-    lock: () => { botOn = false; releaseWake(); A.lock(); ui.diag = null; render(true); },
-    remove: () => { if (!confirm("Remove the saved account from this device? You'll need your Key ID and secret to connect again.")) return; botOn = false; A.remove(); ui.diag = null; ui.formError = ""; render(true); },
+    "reset-pass": () => {
+      try {
+        const rec = A.resetByName(drafts.resetName);
+        botOn = false; releaseWake();
+        Object.assign(drafts, { label: rec.label, keyId: rec.keyId }); delete drafts.resetName; delete drafts.unlockPass; delete drafts.secret; delete drafts.passcode;
+        Object.assign(ui, { connectNew: true, forgotOpen: false, formError: "", diag: null, reveal: {} });
+        toast("Passcode reset. Paste your secret key and choose a new passcode.", "good");
+      } catch (e) { toast(e.message, "bad"); }
+      render(true);
+    },
+    "back-locked": () => { ui.connectNew = false; ui.formError = ""; render(true); },
+    "toggle-reveal": el => { const k = el.dataset.key; ui.reveal[k] = !ui.reveal[k]; render(true); document.getElementById(el.dataset.target)?.focus(); },
+    "clear-field": el => { drafts[el.dataset.key] = ""; render(true); document.getElementById(el.dataset.target)?.focus(); },
+    lock: () => { botOn = false; releaseWake(); ui.connectNew = false; ui.reveal = {}; A.lock(); ui.diag = null; render(true); },
+    remove: () => { if (!confirm("Remove the saved account from this device? You'll need your Key ID and secret to connect again.")) return; botOn = false; A.remove(); ui.connectNew = false; ui.diag = null; ui.formError = ""; render(true); },
     refresh: () => guard("refresh", async () => { await A.refresh(); toast(A.state.health.ok ? "Balance updated." : A.state.health.message, A.state.health.ok ? "good" : "bad"); }),
     diag: () => runDiagnostics(),
     rescan: async () => { bboCache.clear(); await runScan(); render(true); },
@@ -552,7 +594,7 @@
     e.target.value = String(cfg[k]); // show the saved (or reverted) value right away, without rebuilding the page
     setTimeout(() => render(false), 150);
   });
-  document.addEventListener("toggle", e => { if (e.target?.id === "rawBal") ui.rawOpen = e.target.open; }, true);
+  document.addEventListener("toggle", e => { if (e.target?.id === "forgot") ui.forgotOpen = e.target.open; }, true);
   document.addEventListener("keydown", e => {
     if (e.key !== "Enter" || e.target.tagName !== "INPUT") return;
     const t = e.target;

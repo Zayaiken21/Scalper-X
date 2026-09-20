@@ -101,7 +101,7 @@ window.BlueEdgeStrategy = (() => {
       if (m.marketSides.length > 2) return { reason: "multiSided" };
       if (m.marketSides.some(s => s.tradable === false)) return { reason: "inactive" };
     }
-    if (m.endDate) { const t = Date.parse(m.endDate); if (Number.isFinite(t) && t - Date.now() > horizonMs) return { reason: "farFuture" }; } // a past endDate is fine: live games can carry their scheduled time
+    if (m.endDate && !m._live) { const t = Date.parse(m.endDate); if (Number.isFinite(t) && t - Date.now() > horizonMs) return { reason: "farFuture" }; } // a past endDate is fine: live games can carry their scheduled time
     const pl = plan(cfg), vol = num(m.volume24hr);
     if (vol != null && vol < pl.minVolume) return { reason: "lowVolume" };
     const q = quotesOf(m);
@@ -136,7 +136,7 @@ window.BlueEdgeStrategy = (() => {
     const skip = excludeSlugs instanceof Set ? excludeSlugs : new Set(excludeSlugs || []);
     const all = [];
     for (const m of markets || []) { if (skip.has(m.slug)) continue; for (const c of candidateSides(m, cfg, horizonMs)) all.push(c); }
-    all.sort((a, b) => (b.score - a.score) || ((b.vol || 0) - (a.vol || 0)));
+    all.sort((a, b) => (!!b.market._live - !!a.market._live) || (b.score - a.score) || ((b.vol || 0) - (a.vol || 0))); // in-play markets first
     return all;
   }
   // The price range the strategy is choosing from right now (its best candidates), for display.
