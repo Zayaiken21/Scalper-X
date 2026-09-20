@@ -47,9 +47,9 @@ window.PolyUS = (() => {
     return { "X-PM-Access-Key": keyId, "X-PM-Timestamp": timestamp, "X-PM-Signature": bytesToB64(sig) };
   }
 
-  /* ---------- shared rate limiter: token bucket, ~8 req/s sustained (limit is 20/s), plus a global cool-down on 429 ---------- */
-  const RATE = 8, BURST = 8;
-  let tokens = BURST, lastFill = Date.now(), cooldownUntil = 0, pumping = false;
+  /* ---------- shared rate limiter: token bucket, ~6 req/s sustained, bursts of 4 (limit is 20/s), plus a global cool-down on 429 ---------- */
+  const RATE = 6, BURST = 4;
+  let tokens = BURST, lastFill = Date.now(), cooldownUntil = 0, pumping = false, last429 = 0;
   const queue = [];
   function pump() {
     if (pumping) return; pumping = true;
@@ -93,7 +93,7 @@ window.PolyUS = (() => {
       clearTimeout(timer);
       if (res.status === 429) { // rejected, not processed — safe to retry. Docs: wait >= 1s, then exponential backoff.
         if (attempt >= retries) throw new PolyError("Polymarket US is rate-limiting requests. The app will retry shortly.", "rate", 429);
-        cooldownUntil = Date.now() + 1000 * 2 ** attempt + Math.random() * 400;
+        last429 = Date.now(); cooldownUntil = Date.now() + 1000 * 2 ** attempt + Math.random() * 400;
         continue;
       }
       let json = null; try { const t = await res.text(); json = t ? JSON.parse(t) : null; } catch {}
@@ -134,5 +134,6 @@ window.PolyUS = (() => {
     };
   }
 
-  return { PolyError, importSecret, client, publicClient, API, GATEWAY };
+  const rateInfo = () => ({ last429 });
+  return { PolyError, importSecret, client, publicClient, rateInfo, API, GATEWAY };
 })();

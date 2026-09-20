@@ -15,7 +15,7 @@ window.BlueEdgeStrategy = (() => {
   const TAKER_THETA = 0.0695; // fee = theta × contracts × p × (1−p), per docs.polymarket.us/fees (effective Sep 17, 2026)
 
   // The strategy decides the trade shape. The user only controls risk: stake, stop loss, how many trades, daily loss cap.
-  const HORIZONS = [3 * 3600000, 24 * 3600000, 7 * 24 * 3600000]; // tries markets closing soon first, widens only if too few candidates
+  const HORIZONS = [3 * 3600000, 24 * 3600000, 7 * 24 * 3600000, Infinity]; // tries markets closing soon first, widens only if too few candidates
   const DEFAULTS = {
     stakeUsd: 5,          // dollars per entry
     stopLoss: 0.05,       // bail if the exit price falls this far below entry
@@ -86,20 +86,49 @@ window.BlueEdgeStrategy = (() => {
     return out;
   }
 
-  // A market is only considered if it's genuinely tradeable: open, binary, closing inside the horizon, with enough
-  // volume and a tight spread — noisy/illiquid markets make for bad fills however cheap the odds look.
-  function candidateSides(m, cfg, horizonMs = HORIZONS[0]) {
-    if (!m || !m.slug) return [];
-    if (m.active === false || m.closed === true || m.archived === true || m.hidden === true) return [];
+  const REASONS = {
+    inactive: "not open for trading", multiSided: "more than two outcomes", farFuture: "closes too far out",
+    lowVolume: "too little trading", noQuotes: "no live price yet", wideSpread: "spread too wide",
+    pricing: "odds or fees not worth it", minSize: "stake below the market's minimum size",
+  };
+
+  // Why a market is (or isn't) a buy. Missing data never disqualifies a market by itself: the live API's fields drift
+  // from its docs, so an absent volume figure is treated as "unknown", not "zero".
+  function classify(m, cfg, horizonMs = HORIZONS[0]) {
+    if (!m || !m.slug) return { reason: "inactive" };
+    if (m.active === false || m.closed === true || m.archived === true || m.hidden === true || m.acceptingOrders === false) return { reason: "inactive" };
     if (Array.isArray(m.marketSides)) {
-      if (m.marketSides.length > 2) return [];
-      if (m.marketSides.some(s => s.tradable === false)) return [];
+      if (m.marketSides.length > 2) return { reason: "multiSided" };
+      if (m.marketSides.some(s => s.tradable === false)) return { reason: "inactive" };
     }
-    if (m.endDate) { const t = Date.parse(m.endDate); if (Number.isFinite(t) && t - Date.now() > horizonMs) return []; } // a past endDate is fine: live games can carry their scheduled time
-    const vol = num(m.volume24hr);
-    if (vol == null || vol < plan(cfg).minVolume) return [];
+    if (m.endDate) { const t = Date.parse(m.endDate); if (Number.isFinite(t) && t - Date.now() > horizonMs) return { reason: "farFuture" }; } // a past endDate is fine: live games can carry their scheduled time
+    const pl = plan(cfg), vol = num(m.volume24hr);
+    if (vol != null && vol < pl.minVolume) return { reason: "lowVolume" };
     const q = quotesOf(m);
-    return sidesFromQuotes(q, cfg).map(s => ({ ...s, market: m, vol, spread: q.ask - q.bid, score: (1 - s.costRatio) * Math.log10(vol + 10) }));
+    if (!validQuotes(q)) return { reason: "noQuotes" };
+    if (q.ask - q.bid > pl.maxSpread + 1e-9) return { reason: "wideSpread", q };
+    const sides = sidesFromQuotes(q, cfg);
+    if (!sides.length) return { reason: "pricing", q };
+    const minQty = num(m.minimumTradeQty);
+    const ok = sides.filter(x => minQty == null || cfg.stakeUsd / x.price >= minQty);
+    if (!ok.length) return { reason: "minSize", q };
+    return { sides: ok, q, vol };
+  }
+  function candidateSides(m, cfg, horizonMs = HORIZONS[0]) {
+    const r = classify(m, cfg, horizonMs);
+    if (!r.sides) return [];
+    return r.sides.map(x => ({ ...x, market: m, vol: r.vol ?? 0, spread: r.q.ask - r.q.bid, score: (1 - x.costRatio) * Math.log10((r.vol ?? 0) + 10) }));
+  }
+  // Counts of why markets were skipped, so "nothing to buy" is always explainable.
+  function summarize(markets, cfg, horizonMs = HORIZONS[0]) {
+    const reasons = {}; let candidates = 0, withPrices = 0;
+    for (const m of markets || []) {
+      const r = classify(m, cfg, horizonMs);
+      if (r.q || validQuotes(quotesOf(m))) withPrices++;
+      if (r.sides) candidates++; else reasons[r.reason] = (reasons[r.reason] || 0) + 1;
+    }
+    const top = Object.entries(reasons).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${REASONS[k]}`);
+    return { total: (markets || []).length, withPrices, candidates, reasons, text: top.slice(0, 3).join(", ") };
   }
 
   // Rank buy candidates: cheapest round-trip cost relative to the target, weighted by how much the market trades.
@@ -107,7 +136,7 @@ window.BlueEdgeStrategy = (() => {
     const skip = excludeSlugs instanceof Set ? excludeSlugs : new Set(excludeSlugs || []);
     const all = [];
     for (const m of markets || []) { if (skip.has(m.slug)) continue; for (const c of candidateSides(m, cfg, horizonMs)) all.push(c); }
-    all.sort((a, b) => (b.score - a.score) || (b.vol - a.vol));
+    all.sort((a, b) => (b.score - a.score) || ((b.vol || 0) - (a.vol || 0)));
     return all;
   }
   // The price range the strategy is choosing from right now (its best candidates), for display.
@@ -145,5 +174,5 @@ window.BlueEdgeStrategy = (() => {
     return Math.max(1, Math.min(cfg.stakeUsd, Math.floor((buyingPower ?? cfg.stakeUsd) * 0.9)));
   }
 
-  return { HORIZONS, DEFAULTS, LIMITS, plan, sanitize, validateField, quotesOf, validQuotes, sidesFromQuotes, candidateSides, scanForEntries, autoBand, exitPrice, entryPrice, evaluateExit, fillPxForSide, fee, netPnl, stakeFor, amt, num };
+  return { HORIZONS, DEFAULTS, LIMITS, plan, sanitize, validateField, quotesOf, validQuotes, sidesFromQuotes, candidateSides, classify, summarize, REASONS, scanForEntries, autoBand, exitPrice, entryPrice, evaluateExit, fillPxForSide, fee, netPnl, stakeFor, amt, num };
 })();

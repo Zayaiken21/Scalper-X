@@ -15,6 +15,7 @@ window.BlueEdgeAccount = (() => {
     status: "none",                       // none | locked | unlocked
     account: null,                        // {id,label,keyId,updatedAt}
     balance: null, buyingPower: null, assetValue: null,
+    bal: null,                            // full parsed balance breakdown (see parseBalance)
     positions: [],                        // normalised: [{slug, qty, side, cost, cashValue, title}]
     positionsAt: 0,                       // when positions were last fetched OK (used to reconcile bot trades)
     orders: [],
@@ -62,8 +63,9 @@ window.BlueEdgeAccount = (() => {
     await PolyUS.importSecret(secretKey); // fail fast on an unusable secret, before anything is stored
     const sealed = await seal({ keyId, secretKey }, passcode);
     const id = "acc_" + Date.now().toString(36);
-    // One account at a time: a fresh connect replaces any earlier (possibly mistyped) one.
-    writeStore({ active: id, list: [{ id, label: String(label || "").trim() || "Polymarket US", keyId, updatedAt: Date.now(), ...sealed }] });
+    // Never discard a saved account: only a record with the SAME Key ID is replaced (re-saving with a new passcode); any others are kept.
+    const prior = readStore();
+    writeStore({ active: id, list: [...prior.list.filter(r => r.keyId !== keyId), { id, label: String(label || "").trim() || "Polymarket US", keyId, updatedAt: Date.now(), ...sealed }] });
     return unlock(id, passcode);
   }
 
@@ -86,7 +88,7 @@ window.BlueEdgeAccount = (() => {
   function lock() {
     sdk = null; state.status = hasVault() ? "locked" : "none";
     state.account = savedMeta();
-    Object.assign(state, { balance: null, buyingPower: null, assetValue: null, positions: [], positionsAt: 0, orders: [], lastRefresh: 0, lastOk: 0, health: { ok: null, message: "" } });
+    Object.assign(state, { balance: null, buyingPower: null, assetValue: null, bal: null, positions: [], positionsAt: 0, orders: [], lastRefresh: 0, lastOk: 0, health: { ok: null, message: "" } });
     emit();
   }
   function remove() {
@@ -126,6 +128,31 @@ window.BlueEdgeAccount = (() => {
     };
   }
 
+  // Polymarket US documents these balance fields. There is NO documented bonus or withdrawable field, so anything extra
+  // the API returns is kept and shown under its own name, and "withdrawable" is offered only as a labelled estimate.
+  const KNOWN = new Set(["currentBalance", "currency", "lastUpdated", "buyingPower", "assetNotional", "assetAvailable", "pendingCredit", "openOrders", "unsettledFunds", "pendingWithdrawals", "marginRequirement", "balanceReservation"]);
+  function parseBalance(row) {
+    const n = k => num(row?.[k]);
+    const cash = n("currentBalance") ?? 0;
+    const wds = Array.isArray(row?.pendingWithdrawals) ? row.pendingWithdrawals : [];
+    const wdTotal = wds.reduce((s, w) => s + (amt(w?.balance) ?? 0), 0);
+    const openOrders = n("openOrders") ?? 0, unsettled = n("unsettledFunds") ?? 0, reservation = n("balanceReservation") ?? 0;
+    const extras = {};
+    for (const [k, v] of Object.entries(row || {})) {
+      if (KNOWN.has(k)) continue;
+      const val = (v && typeof v === "object" && "value" in v) ? v.value : v;
+      if ((typeof val === "number" || (typeof val === "string" && val !== "")) && typeof v !== "boolean") extras[k] = val;
+    }
+    const pick = re => { for (const [k, v] of Object.entries(extras)) if (re.test(k) && num(v) != null) return { key: k, value: num(v) }; return null; };
+    return {
+      cash, buyingPower: n("buyingPower") ?? 0, assetNotional: n("assetNotional"), assetAvailable: n("assetAvailable"),
+      pendingCredit: n("pendingCredit"), openOrders, unsettled, margin: n("marginRequirement"), reservation,
+      pendingWithdrawals: wdTotal, extras, bonus: pick(/bonus|promo|reward/i), withdrawableReported: pick(/withdraw/i),
+      withdrawableEst: Math.max(0, Number((cash - openOrders - unsettled - wdTotal - reservation).toFixed(2))),
+      lastUpdated: row?.lastUpdated || null, raw: row,
+    };
+  }
+
   /* ---------- refresh (balance, positions, open orders) ---------- */
   function refresh() {
     if (!isUnlocked()) return Promise.resolve();
@@ -137,7 +164,7 @@ window.BlueEdgeAccount = (() => {
         if (balRes.status === "fulfilled") {
           const rows = balRes.value?.balances || [];
           const row = rows.find(b => !b.currency || b.currency === "USD") || rows[0];
-          if (row) { state.balance = num(row.currentBalance) ?? 0; state.buyingPower = num(row.buyingPower) ?? 0; state.assetValue = num(row.assetNotional); }
+          if (row) { const b = parseBalance(row); state.bal = b; state.balance = b.cash; state.buyingPower = b.buyingPower; state.assetValue = b.assetNotional; }
           state.lastOk = Date.now(); state.health = { ok: true, message: "" };
         } else {
           state.health = { ok: false, message: balRes.reason?.message || "Couldn't load balance." };
@@ -172,5 +199,5 @@ window.BlueEdgeAccount = (() => {
   state.status = hasVault() ? "locked" : "none";
   state.account = savedMeta();
 
-  return { state, on, savedMeta, hasVault, save, unlock, lock, remove, refresh, buyMarket, closeNow, cancelAllOpen, isUnlocked, client, parseOrderResult, normalisePositions };
+  return { state, on, savedMeta, hasVault, save, unlock, lock, remove, refresh, buyMarket, closeNow, cancelAllOpen, isUnlocked, client, parseOrderResult, normalisePositions, parseBalance };
 })();

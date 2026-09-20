@@ -785,3 +785,17 @@ body { touch-action: manipulation; overscroll-behavior-y: none; }
 
 .hint.auto { color: var(--muted); }
 .fld input { scroll-margin-bottom: 120px; }
+
+/* ---------- v1.2: balance breakdown + market list ---------- */
+.bal-table { display: grid; gap: 0; margin-top: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); overflow: hidden; }
+.bal-table .balrow { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 11px 12px; margin: 0; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: var(--bg-2); box-shadow: none; }
+.bal-table .balrow:last-child { border-bottom: 0; }
+.balrow > span { font-size: 14px; font-weight: 700; min-width: 0; }
+.balrow > span small { display: block; margin-top: 2px; font-size: 12px; font-weight: 500; color: var(--faint); overflow-wrap: anywhere; }
+.balrow > b { font-variant-numeric: tabular-nums; white-space: nowrap; }
+details#rawBal { margin-top: 12px; }
+details#rawBal summary { cursor: pointer; font-size: 13px; color: var(--muted); min-height: 32px; display: flex; align-items: center; }
+details#rawBal pre { margin: 8px 0 0; padding: 12px; max-height: 260px; overflow: auto; font-size: 12px; line-height: 1.45; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius-sm); color: var(--muted); }
+.market-card .actions { margin-top: 10px; }
+.market-card .actions .btn { flex: 1 1 0; }
+.block-head .btn.small { flex: none; }

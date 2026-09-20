@@ -18,13 +18,16 @@
   let trades = (store.get(TRADES_KEY, []) || []).filter(t => t && t.marketSlug && t.status !== "failed");
   let botOn = false;                       // the bot always starts OFF after a reload — real money should never resume unattended
   let view = "home", botNote = "Bot is off.";
-  const scan = { rows: [], at: 0, error: "", scanning: false, horizonMs: S.HORIZONS[0] };
+  const scan = { rows: [], at: 0, error: "", scanning: false, horizonMs: S.HORIZONS[0], sum: null };
+  const bboCache = new Map();              // slug -> { q, at }: per-market price lookups, reused for 15s
   const drafts = {};                       // what the user has typed but not saved yet — survives any redraw
-  const ui = { busy: null, formError: "", diag: null, diagRunning: false };
+  const ui = { busy: null, formError: "", diag: null, diagRunning: false, rawOpen: false };
   let entryFails = 0, entryPausedUntil = 0;
-  const REFRESH_MS = 10000, SCAN_MS = 5000, TICK_MS = 2000, COOLDOWN_MS = 10 * 60000;
+  const REFRESH_MS = 10000, SCAN_MS = 8000, TICK_MS = 2000, COOLDOWN_MS = 10 * 60000;
+  // After any 429 the app halves its own polling for a minute, so it can never keep pushing against a limit.
+  const slow = () => (Date.now() - window.PolyUS.rateInfo().last429 < 60000 ? 2 : 1);
 
-  const saveCfg = () => store.set(CFG_KEY, cfg);
+  const saveCfg = () => store.set(CFG_KEY, { ...(store.get(CFG_KEY, {}) || {}), ...cfg }); // merges into what's already stored, so older saved settings are never dropped
   function saveTrades() {
     const done = trades.filter(t => t.status === "closed").slice(-150);
     trades = trades.filter(t => t.status === "open" || t.status === "pending" || done.includes(t)); // history pruning must never drop a live trade
@@ -47,24 +50,47 @@
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   /* ---------- market data ---------- */
+  const byVolume = (a, b) => (S.num(b.volume24hr) || 0) - (S.num(a.volume24hr) || 0);
   async function fetchMarkets(horizonMs) {
-    const q = { active: true, closed: false, limit: 100, endDateMax: new Date(Date.now() + horizonMs).toISOString() };
-    let res;
-    try { res = await PUB.markets({ ...q, orderBy: ["volume24hr"], orderDirection: "desc" }); }
-    catch (e) { if (e.status !== 400) throw e; res = await PUB.markets(q); } // if the server dislikes the sort field, fall back to unsorted and sort locally
-    const rows = (res?.markets || []).filter(m => String(m.category || "").toLowerCase() !== "crypto");
-    return rows.sort((a, b) => (S.num(b.volume24hr) || 0) - (S.num(a.volume24hr) || 0));
+    const base = { limit: 100 };
+    const filtered = { ...base, active: true, closed: false };
+    if (Number.isFinite(horizonMs)) filtered.endDateMax = new Date(Date.now() + horizonMs).toISOString();
+    const pull = async params => { // if the server dislikes the sort field, retry unsorted rather than fail
+      try { return await PUB.markets({ ...params, orderBy: ["volume24hr"], orderDirection: "desc" }); }
+      catch (e) { if (!(e.status >= 400 && e.status < 500) || e.status === 429) throw e; return PUB.markets(params); }
+    };
+    let rows = (await pull(filtered))?.markets || [];
+    if (!rows.length) rows = (await pull(base))?.markets || []; // filters can be picky: an unfiltered list beats an empty one
+    return rows.filter(m => String(m.category || "").toLowerCase() !== "crypto").sort(byVolume);
   }
-  // The strategy picks the time window: markets closing soon first, widening only when there are too few candidates.
+  // The list endpoint doesn't always carry live prices. For the busiest markets missing them, ask for the best bid/offer
+  // directly — capped per pass and cached, so this stays a handful of requests, never a flood.
+  async function fillQuotes(rows) {
+    let budget = 12;
+    for (const m of rows) {
+      if (S.validQuotes(S.quotesOf(m))) continue;
+      let c = bboCache.get(m.slug);
+      if (!c || Date.now() - c.at > 15000) {
+        if (budget-- <= 0) continue;
+        let q = null; try { const r = S.quotesOf(await PUB.bbo(m.slug)); if (S.validQuotes(r)) q = r; } catch {}
+        c = { q, at: Date.now() }; bboCache.set(m.slug, c);
+      }
+      if (c.q) { m.bestBidQuote = c.q.bid; m.bestAskQuote = c.q.ask; if (c.q.bidDepth != null) m.bidDepth = c.q.bidDepth; if (c.q.askDepth != null) m.askDepth = c.q.askDepth; }
+    }
+  }
+  const pickHorizon = (rows, list) => list.find(h => S.scanForEntries(rows, cfg, new Set(), h).length >= 3);
+  // Markets closing soon first; widen the window only if there are too few worth buying. At most two list requests per pass.
   async function runScan() {
     scan.scanning = true;
     try {
-      let rows = [], used = S.HORIZONS[0];
-      for (const h of S.HORIZONS) {
-        rows = await fetchMarkets(h); used = h;
-        if (S.scanForEntries(rows, cfg, new Set(), h).length >= 3) break;
+      let rows = await fetchMarkets(S.HORIZONS[1]); await fillQuotes(rows);
+      let used = pickHorizon(rows, S.HORIZONS.slice(0, 2));
+      if (used === undefined) {
+        const wide = await fetchMarkets(Infinity), seen = new Set(rows.map(m => m.slug));
+        rows = rows.concat(wide.filter(m => !seen.has(m.slug))).sort(byVolume); await fillQuotes(rows);
+        used = pickHorizon(rows, S.HORIZONS.slice(1)) ?? Infinity;
       }
-      scan.rows = rows; scan.horizonMs = used; scan.at = Date.now(); scan.error = "";
+      scan.rows = rows; scan.horizonMs = used; scan.at = Date.now(); scan.error = ""; scan.sum = S.summarize(rows, cfg, used);
     } catch (e) { scan.error = e.message; scan.at = Date.now(); }
     scan.scanning = false;
   }
@@ -188,7 +214,7 @@
       ...trades.filter(t => t.status === "closed" && now - t.closedAt < COOLDOWN_MS).map(t => t.marketSlug), // no instant re-entry after an exit
     ]);
     const cands = S.scanForEntries(scan.rows, cfg, skip, scan.horizonMs);
-    if (!cands.length) { botNote = `Watching ${scan.rows.length} markets. Nothing worth buying right now.`; return; }
+    if (!cands.length) { botNote = `Watching ${scan.rows.length} markets, none worth buying yet${scan.sum?.text ? ` (${scan.sum.text})` : ""}.`; return; }
     let placed = 0, tried = 0, lastErr = "";
     for (const c of cands) {
       if (placed >= slots || tried >= slots + 2) break;
@@ -214,8 +240,8 @@
   /* ---------- the loop ---------- */
   async function tick() {
     const now = Date.now();
-    if (A.isUnlocked() && now - A.state.lastRefresh > REFRESH_MS) await A.refresh().catch(() => {});
-    if (((botOn && A.isUnlocked()) || view === "markets") && now - scan.at > SCAN_MS && !scan.scanning) { await runScan(); render(); }
+    if (A.isUnlocked() && now - A.state.lastRefresh > REFRESH_MS * slow()) await A.refresh().catch(() => {});
+    if (((botOn && A.isUnlocked()) || view === "markets") && now - scan.at > SCAN_MS * slow() && !scan.scanning) { await runScan(); render(); }
     if (A.isUnlocked()) {
       await exclusive(async () => { await manageTrades(); await enterTrades(); });
       if (!botOn) botNote = trades.some(t => t.status === "open") ? "Bot is off — no new entries. Open trades still follow your exit rules." : "Bot is off.";
@@ -225,7 +251,7 @@
   async function loop() { try { await tick(); } catch (e) { console.error(e); } setTimeout(loop, TICK_MS); }
 
   /* ---------- views ---------- */
-  const HORIZON_TEXT = { [S.HORIZONS[0]]: "closing within 3 hours", [S.HORIZONS[1]]: "closing within 24 hours", [S.HORIZONS[2]]: "closing within 7 days" };
+  const HORIZON_TEXT = { [S.HORIZONS[0]]: "closing within 3 hours", [S.HORIZONS[1]]: "closing within 24 hours", [S.HORIZONS[2]]: "closing within 7 days", [Infinity]: "of any closing date" };
   function autoLine() {
     const band = S.autoBand(S.scanForEntries(scan.rows, cfg, new Set(), scan.horizonMs));
     if (!scan.at) return "The strategy picks the prices, targets and timing for you. It will show its chosen range here once it has scanned.";
@@ -246,6 +272,8 @@
         <div class="stat-grid">
           <div><span>Cash balance</span><b>${money(A.state.balance)}</b></div>
           <div><span>Buying power</span><b>${money(A.state.buyingPower)}</b></div>
+          ${A.state.bal ? `<div><span>${A.state.bal.withdrawableReported ? "Withdrawable" : "Withdrawable (est.)"}</span><b>${money(A.state.bal.withdrawableReported ? A.state.bal.withdrawableReported.value : A.state.bal.withdrawableEst)}</b></div>` : ""}
+          ${A.state.bal?.bonus ? `<div><span>Bonus balance</span><b>${money(A.state.bal.bonus.value)}</b></div>` : ""}
           <div><span>Open trades</span><b>${open.length} / ${cfg.maxOpen}</b></div>
           <div><span>Today, closed</span><b class="${pnl >= 0 ? "gain" : "loss"}">${smoney(pnl)}</b></div>
         </div>
@@ -256,19 +284,49 @@
       </div>`;
   }
 
+  function balanceDetails() {
+    const b = A.state.bal; if (!b) return "";
+    const row = (k, v, hint) => v == null ? "" : `<div class="balrow"><span>${esc(k)}${hint ? `<small>${esc(hint)}</small>` : ""}</span><b>${money(v)}</b></div>`;
+    const extras = Object.entries(b.extras).map(([k, v]) => `<div class="balrow"><span>${esc(k)}<small>Extra field reported by Polymarket</small></span><b>${esc(String(v))}</b></div>`).join("");
+    return `<div class="bal-table">
+      ${b.bonus ? row("Bonus balance", b.bonus.value, `Reported by Polymarket as “${b.bonus.key}”`) : ""}
+      ${row("Cash balance", b.cash, "Money in your account, not counting positions")}
+      ${row("Buying power", b.buyingPower, "What you can spend on new trades")}
+      ${b.withdrawableReported ? row("Withdrawable", b.withdrawableReported.value, `Reported by Polymarket as “${b.withdrawableReported.key}”`) : row("Withdrawable (estimate)", b.withdrawableEst, "Cash not tied up in orders, unsettled funds or pending withdrawals")}
+      ${row("Positions value", b.assetNotional, "Current value of your open positions")}
+      ${row("Available collateral", b.assetAvailable)}
+      ${row("Pending credits", b.pendingCredit)}
+      ${row("In open orders", b.openOrders)}
+      ${row("Unsettled funds", b.unsettled, "Not yet available to trade")}
+      ${row("Pending withdrawals", b.pendingWithdrawals)}
+      ${row("Margin requirement", b.margin)}
+      ${row("Reserved", b.reservation)}
+      ${extras}
+    </div>
+    ${!b.bonus || !b.withdrawableReported ? `<p class="hint">Polymarket US's balance data has no separate bonus or withdrawable field, so ${!b.bonus ? "a bonus balance can't be shown separately" : ""}${!b.bonus && !b.withdrawableReported ? " and " : ""}${!b.withdrawableReported ? "withdrawable is an estimate that may include bonus funds" : ""}. Check the Withdraw screen in Polymarket before moving money.</p>` : ""}
+    <details ${ui.rawOpen ? "open" : ""} id="rawBal"><summary>Raw balance data from Polymarket</summary><pre>${esc(JSON.stringify(b.raw, null, 2))}</pre></details>`;
+  }
+
+  function marketRow(m, pick, held, stake) {
+    const q = S.quotesOf(m), ok = S.validQuotes(q), vol = S.num(m.volume24hr);
+    const prices = ok ? `<span>YES ${cents(q.ask)}</span><span>NO ${cents(1 - q.bid)}</span><span>spread ${cents(q.ask - q.bid)}</span>` : `<span>price loading…</span>`;
+    const buy = A.isUnlocked() && ok && !held ? `<div class="actions">${["YES", "NO"].map(side => `<button class="btn small ${pick?.side === side ? "primary" : ""}" data-act="manual-buy" data-slug="${esc(m.slug)}" data-side="${side}" ${ui.busy ? "disabled" : ""}>Buy ${side} · ${money(stake)}</button>`).join("")}</div>` : "";
+    return `<div class="market-card ${held ? "held" : ""}"><b>${esc(m.question || m.title || m.slug)}</b>
+      ${pick ? `<span class="pill good" style="margin:6px 0 2px">Strategy pick: ${pick.side} at ${cents(pick.price)}</span>` : ""}
+      <div class="row">${prices}${vol != null ? `<span>${Math.round(vol).toLocaleString()} traded/24h</span>` : ""}</div>${buy}</div>`;
+  }
   function marketsView() {
-    const rows = S.scanForEntries(scan.rows, cfg, new Set(), scan.horizonMs).slice(0, 30);
+    const picks = new Map();
+    for (const c of S.scanForEntries(scan.rows, cfg, new Set(), scan.horizonMs)) if (!picks.has(c.market.slug)) picks.set(c.market.slug, c);
     const held = new Set(trades.filter(openish).map(t => t.marketSlug));
-    const status = scan.at && !scan.error ? `${scan.rows.length} live markets scanned · ${rows.length} the strategy would buy` : (scan.error ? "Couldn't load markets." : "Loading live markets…");
-    const head = `<div class="panel"><p class="hint" style="margin:0">${esc(status)}</p>${scan.error ? `<p class="note bad">${esc(scan.error)}</p>` : ""}</div>`;
-    if (!rows.length) return `${head}${scan.at && !scan.error ? `<div class="panel" style="margin-top:12px"><p class="hint" style="margin:0">Nothing is worth buying right now — the strategy skips markets where spread and fees would eat the profit.</p></div>` : ""}`;
-    const stake = S.stakeFor(cfg, A.state.buyingPower);
-    return `${head}<div class="market-grid" style="margin-top:12px">${rows.map(c => `
-      <div class="market-card ${held.has(c.market.slug) ? "held" : ""}">
-        <b>${esc(c.market.question || c.market.title || c.market.slug)}</b>
-        <div class="row"><span>${c.side}</span><span>${cents(c.price)}</span><span>${Math.round(c.vol).toLocaleString()} traded/24h</span><span>spread ${cents(c.spread)}</span></div>
-        ${A.isUnlocked() && !held.has(c.market.slug) ? `<button class="btn small" style="margin-top:10px" data-act="manual-buy" data-slug="${esc(c.market.slug)}" data-side="${c.side}" ${ui.busy ? "disabled" : ""}>Buy ${c.side} · ${money(stake)}</button>` : ""}
-      </div>`).join("")}</div>`;
+    const sum = scan.sum, stake = S.stakeFor(cfg, A.state.buyingPower);
+    const sorted = [...scan.rows].sort((a, b) => (picks.has(b.slug) - picks.has(a.slug)));
+    const status = scan.error && !scan.rows.length ? "Couldn't load markets." : scan.at ? `${scan.rows.length} live markets · ${sum?.withPrices ?? 0} with prices · ${picks.size} the strategy would buy` : "Loading live markets…";
+    const head = `<div class="panel"><div class="block-head"><p class="hint" style="margin:0">${esc(status)}</p><button class="btn small" data-act="rescan" ${scan.scanning ? "disabled" : ""}>${scan.scanning ? "Loading…" : "Refresh"}</button></div>
+      ${scan.error ? `<p class="note bad">${esc(scan.error)} <a href="#settings">Open Settings → Test connection</a> to see which step fails.</p>` : ""}
+      ${sum && scan.rows.length && !picks.size ? `<p class="hint">Nothing worth buying right now${sum.text ? ` — skipped: ${esc(sum.text)}` : ""}. You can still buy any market below by hand.</p>` : ""}</div>`;
+    if (!scan.rows.length) return head;
+    return `${head}<div class="market-grid" style="margin-top:12px">${sorted.slice(0, 40).map(m => marketRow(m, picks.get(m.slug), held.has(m.slug), stake)).join("")}</div>`;
   }
 
   function tradeRow(t) {
@@ -318,13 +376,10 @@
       const h = A.state.health;
       return `<div class="panel">
         <div class="block-head"><h2>${esc(acc.label)}</h2><span class="pill ${h.ok === false ? "bad" : "good"}">${h.ok === false ? "Problem" : h.ok ? "Connected" : "Connecting"}</span></div>
-        <div class="stat-grid">
-          <div><span>Cash balance</span><b>${money(A.state.balance)}</b></div>
-          <div><span>Buying power</span><b>${money(A.state.buyingPower)}</b></div>
-        </div>
         ${h.ok === false ? `<p class="note bad">${esc(h.message)}</p>` : ""}
         <p class="hint" data-live="ago"></p>
-        <p class="hint" style="margin-top:2px">Key ID ${esc(acc.keyId.slice(0, 8))}…${esc(acc.keyId.slice(-4))}</p>
+        ${balanceDetails()}
+        <p class="hint" style="margin-top:8px">Key ID ${esc(acc.keyId.slice(0, 8))}…${esc(acc.keyId.slice(-4))}</p>
         <div class="actions"><button class="btn small" data-act="refresh" ${busy ? "disabled" : ""}>Refresh now</button><button class="btn small" data-act="diag" ${busy || ui.diagRunning ? "disabled" : ""}>${ui.diagRunning ? "Testing…" : "Test connection"}</button><button class="btn small ghost" data-act="lock">Lock</button></div>
         ${diagBlock()}
       </div>`;
@@ -409,7 +464,7 @@
   async function runDiagnostics() {
     ui.diagRunning = true; ui.diag = null; render(true);
     const out = [];
-    try { const r = await PUB.markets({ limit: 1, active: true }); out.push({ ok: true, label: "Market data (gateway.polymarket.us)", detail: `Reachable — returned ${(r?.markets || []).length} market.` }); }
+    try { const r = await PUB.markets({ limit: 1, active: true }); const m0 = (r?.markets || [])[0]; const qq = m0 && S.quotesOf(m0); out.push({ ok: true, label: "Market data (gateway.polymarket.us)", detail: m0 ? `Reachable. Sample market has ${Object.keys(m0).length} fields (${Object.keys(m0).slice(0, 12).join(", ")}…); live prices ${S.validQuotes(qq) ? "included" : "not in the list, fetched per market"}.` : "Reachable, but returned no markets." }); }
     catch (e) { out.push({ ok: false, label: "Market data (gateway.polymarket.us)", detail: e.message }); }
     if (A.isUnlocked()) {
       const sdk = A.client();
@@ -445,6 +500,7 @@
     remove: () => { if (!confirm("Remove the saved account from this device? You'll need your Key ID and secret to connect again.")) return; botOn = false; A.remove(); ui.diag = null; ui.formError = ""; render(true); },
     refresh: () => guard("refresh", async () => { await A.refresh(); toast(A.state.health.ok ? "Balance updated." : A.state.health.message, A.state.health.ok ? "good" : "bad"); }),
     diag: () => runDiagnostics(),
+    rescan: async () => { bboCache.clear(); await runScan(); render(true); },
     "reset-cfg": () => { cfg = S.sanitize({}); for (const k of Object.keys(drafts)) if (k.startsWith("cfg:")) delete drafts[k]; saveCfg(); render(true); toast("Settings reset to defaults.", "good"); },
     "close-trade": el => guard("close", () => exclusive(async () => {
       const t = trades.find(x => x.id === el.dataset.id); if (!t || t.status !== "open") return;
@@ -462,6 +518,8 @@
       if (px == null) { toast("Couldn't get a live price for that market.", "bad"); return; }
       const stake = S.stakeFor(cfg, A.state.buyingPower);
       if ((A.state.buyingPower ?? 0) < stake) { toast(`Buying power ${money(A.state.buyingPower)} is below the ${money(stake)} stake.`, "bad"); return; }
+      const minQty = S.num(row.minimumTradeQty);
+      if (minQty && stake / px < minQty) { toast(`This market needs at least ${minQty} contracts; ${money(stake)} buys about ${(stake / px).toFixed(1)}. Raise your stake.`, "bad"); return; }
       if (!confirm(`Buy ${side} for ${money(stake)}?\n\n${row.question || row.title || slug}\n\nAbout ${cents(px)} per contract, as a market order. The bot will manage the exit.`)) return;
       try { const t = await openTrade({ marketSlug: slug, question: row.question || row.title || slug, side, expectedPx: px, usd: stake, manual: true }); toast(t.status === "open" ? `Bought ${side} at ${cents(t.entry)}` : "Order sent — confirming…", "good"); }
       catch (e) { toast(e.message, "bad"); }
@@ -494,6 +552,7 @@
     e.target.value = String(cfg[k]); // show the saved (or reverted) value right away, without rebuilding the page
     setTimeout(() => render(false), 150);
   });
+  document.addEventListener("toggle", e => { if (e.target?.id === "rawBal") ui.rawOpen = e.target.open; }, true);
   document.addEventListener("keydown", e => {
     if (e.key !== "Enter" || e.target.tagName !== "INPUT") return;
     const t = e.target;
